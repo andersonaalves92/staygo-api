@@ -1,0 +1,104 @@
+import { Request, Response } from "express";
+import { prisma } from "../lib/prisma";
+
+export async function matchRule(request: Request, response: Response) {
+  try {
+    const { companyId, message } = request.body;
+
+    if (!companyId || !message) {
+      return response.status(400).json({
+        error: "companyId e message são obrigatórios",
+      });
+    }
+
+    const normalizedMessage = String(message).toLowerCase();
+
+    const rules = await prisma.faqRule.findMany({
+      where: {
+        companyId,
+        active: true,
+      },
+      orderBy: {
+        priority: "desc",
+      },
+    });
+
+    const found = rules.find((rule) =>
+      normalizedMessage.includes(rule.triggerValue.toLowerCase())
+    );
+
+    if (!found) {
+      return response.json({ matched: false });
+    }
+
+    return response.json({
+      matched: true,
+      responseText: found.responseText,
+    });
+  } catch (error) {
+    console.error(error);
+    return response.status(500).json({
+      error: "Erro ao buscar regra",
+    });
+  }
+}
+
+export async function listRules(request: Request, response: Response) {
+  try {
+    const { companyId } = request.query;
+
+    const rules = await prisma.faqRule.findMany({
+      where: companyId
+        ? { companyId: String(companyId) }
+        : undefined,
+      orderBy: {
+        priority: "desc",
+      },
+    });
+
+    return response.json(rules);
+  } catch (error) {
+    console.error(error);
+    return response.status(500).json({
+      error: "Erro ao listar regras",
+    });
+  }
+}
+
+export async function createRule(request: Request, response: Response) {
+  try {
+    const {
+      companyId,
+      name,
+      triggerType,
+      triggerValue,
+      responseText,
+      priority,
+    } = request.body;
+
+    if (!companyId || !name || !triggerType || !triggerValue || !responseText) {
+      return response.status(400).json({
+        error: "companyId, name, triggerType, triggerValue e responseText são obrigatórios",
+      });
+    }
+
+    const rule = await prisma.faqRule.create({
+      data: {
+        companyId,
+        name,
+        triggerType,
+        triggerValue,
+        responseText,
+        priority: Number(priority) || 0,
+        active: true,
+      },
+    });
+
+    return response.json(rule);
+  } catch (error) {
+    console.error(error);
+    return response.status(500).json({
+      error: "Erro ao criar regra",
+    });
+  }
+}

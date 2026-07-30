@@ -1,0 +1,169 @@
+import { prisma } from "./prisma";
+
+type AssistantConfig = {
+  enabled: boolean;
+  businessDescription: string;
+  tone: string;
+  instructions: string;
+  handoffKeywords: string;
+  fallbackMessage: string;
+  maxContextMessages: number;
+};
+
+type GenerateReplyInput = {
+  companyId: string;
+  conversationId?: string;
+  message: string;
+  mode?: "reply" | "summary";
+};
+
+const defaultConfig: AssistantConfig = {
+  enabled: false,
+  businessDescription: "",
+  tone: "profissional, humano e objetivo",
+  instructions: "",
+  handoffKeywords: "preço,valor,contrato,humano,atendente,reclamação,cancelar",
+  fallbackMessage: "Vou chamar uma pessoa da equipe para te ajudar melhor.",
+  maxContextMessages: 10,
+};
+
+export function hasOpenAiConfig() {
+  return Boolean(process.env.OPENAI_API_KEY);
+}
+
+export async function getAssistantConfig(companyId: string) {
+  const config = await prisma.aiAssistantConfig.findUnique({ where: { companyId } });
+  return config || null;
+}
+
+export async function getOrCreateAssistantConfig(companyId: string) {
+  const existing = await getAssistantConfig(companyId);
+  if (existing) return existing;
+
+  return prisma.aiAssistantConfig.create({
+    data: {
+      companyId,
+      ...defaultConfig,
+    },
+  });
+}
+
+export function shouldHandoff(config: AssistantConfig, message: string) {
+  const text = String(message || "").toLowerCase();
+  const keywords = config.handoffKeywords
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+
+  return keywords.some((keyword) => text.includes(keyword));
+}
+
+async function buildConversationContext(conversationId?: string, maxContextMessages = 10) {
+  if (!conversationId) return "";
+
+  const messages = await prisma.message.findMany({
+    where: { conversationId },
+    orderBy: { createdAt: "desc" },
+    take: Math.max(1, Math.min(maxContextMessages, 30)),
+  });
+
+  return messages
+    .reverse()
+    .map((message) => `${message.direction === "inbound" ? "Cliente" : "Atendente"}: ${message.body}`)
+    .join("\n");
+}
+
+async function buildKnowledge(companyId: string) {
+  const items = await prisma.knowledgeItem.findMany({
+    where: { companyId, active: true },
+    orderBy: [{ category: "asc" }, { createdAt: "asc" }],
+    take: 30,
+  });
+
+  if (items.length === 0) return "";
+
+  return items
+    .map((item) => `[${item.category}] ${item.title}\n${item.content}`)
+    .join("\n\n");
+}
+
+function buildInstructions(config: AssistantConfig, knowledge = "") {
+  return [
+    "Voce e o assistente de atendimento via WhatsApp da empresa.",
+    "Responda em portugues do Brasil.",
+    "Use mensagens curtas, naturais e humanas, como uma pessoa atendendo no WhatsApp.",
+    "Nao invente preco, prazo, garantia, disponibilidade ou condicoes comerciais.",
+    "Quando precisar de dados para orcamento, faca no maximo duas perguntas objetivas.",
+    "Se o cliente pedir algo sensivel, juridico, financeiro, cancelamento ou falar com humano, encaminhe para atendimento humano.",
+    `Tom de voz: ${config.tone || defaultConfig.tone}.`,
+    config.businessDescription ? `Sobre a empresa:\n${config.businessDescription}` : "",
+    knowledge ? `Conhecimento da empresa:\n${knowledge}` : "",
+    config.instructions ? `Instrucoes especificas:\n${config.instructions}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+export async function generateAssistantReply(input: GenerateReplyInput) {
+  const config = await getOrCreateAssistantConfig(input.companyId);
+
+  if (!config.enabled) {
+    return { enabled: false, reply: null, handoff: false, reason: "assistant_disabled" };
+  }
+
+  if (!hasOpenAiConfig()) {
+    return { enabled: true, reply: null, handoff: false, reason: "openai_not_configured" };
+  }
+
+  if (input.mode !== "summary" && shouldHandoff(config, input.message)) {
+    return {
+      enabled: true,
+      reply: config.fallbackMessage,
+      handoff: true,
+      reason: "handoff_keyword",
+    };
+  }
+
+  const context = await buildConversationContext(input.conversationId, config.maxContextMessages);
+  const knowledge = await buildKnowledge(input.companyId);
+  const model = process.env.OPENAI_MODEL || "gpt-5.2";
+
+  const userContent = input.mode === "summary"
+    ? `Analise a conversa abaixo e retorne um resumo curto, temperatura do lead (frio, morno ou quente), tags sugeridas e proxima acao recomendada.\n\n${context || input.message}`
+    : context
+      ? `Historico recente:\n${context}\n\nNova mensagem do cliente:\n${input.message}`
+      : `Mensagem do cliente:\n${input.message}`;
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      instructions: buildInstructions(config, knowledge),
+      input: [
+        {
+          role: "user",
+          content: userContent,
+        },
+      ],
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.error?.message || "Erro ao gerar resposta com IA");
+  }
+
+  const reply = String(data?.output_text || "").trim();
+
+  return {
+    enabled: true,
+    reply: reply || config.fallbackMessage,
+    handoff: false,
+    reason: "generated",
+  };
+}

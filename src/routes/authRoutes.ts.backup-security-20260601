@@ -1,0 +1,23 @@
+import { Router } from "express";
+import {
+  forgotPassword,
+  googleLogin,
+  login,
+  logout,
+  me,
+  seedOwner,
+  register,
+} from "../controllers/authController";
+import { requireAuth } from "../middlewares/authMiddleware";
+
+const router = Router();
+
+router.post("/seed-owner", seedOwner);
+router.post("/login", login);
+router.post("/google", googleLogin);
+router.post("/forgot-password", forgotPassword);
+router.post("/register", register);
+router.post("/logout", requireAuth, logout);
+router.get("/me", requireAuth, me);
+
+export { router as authRoutes };

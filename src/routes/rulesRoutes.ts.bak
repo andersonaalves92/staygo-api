@@ -1,0 +1,8 @@
+import { Router } from "express";
+import { matchRule, listRules, createRule } from "../controllers/rulesController";
+
+export const rulesRoutes = Router();
+
+rulesRoutes.post("/match", matchRule);
+rulesRoutes.get("/", listRules);
+rulesRoutes.post("/", createRule);

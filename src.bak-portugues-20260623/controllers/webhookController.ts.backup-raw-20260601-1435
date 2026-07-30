@@ -1,0 +1,335 @@
+import { Request, Response } from "express";
+import { prisma } from "../lib/prisma";
+import { generateAssistantReply } from "../lib/aiAssistant";
+import { sendEvolutionText } from "../lib/evolution";
+
+function normalizePhone(value: string) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function extractMessageText(raw: any): string {
+  return (
+    raw?.message?.conversation ||
+    raw?.message?.extendedTextMessage?.text ||
+    raw?.message?.imageMessage?.caption ||
+    raw?.message?.videoMessage?.caption ||
+    (raw?.message?.audioMessage ? "[Audio]" : "") ||
+    (raw?.message?.imageMessage ? "[Imagem]" : "") ||
+    (raw?.message?.videoMessage ? "[Video]" : "") ||
+    (raw?.message?.documentMessage ? "[Documento]" : "") ||
+    raw?.text ||
+    raw?.body ||
+    ""
+  );
+}
+
+function isSupportedEvent(event: string) {
+  const normalized = String(event || "").toUpperCase();
+  return (
+    normalized.includes("MESSAGE") ||
+    normalized.includes("MESSAGES_UPSERT")
+  );
+}
+
+function isConnectionEvent(event: string) {
+  const normalized = String(event || "").toUpperCase();
+  return normalized.includes("CONNECTION");
+}
+
+function normalizeConnectionStatus(payload: any) {
+  const rawStatus =
+    payload?.data?.state ||
+    payload?.data?.status ||
+    payload?.data?.connection ||
+    payload?.state ||
+    payload?.status ||
+    payload?.connection ||
+    "";
+
+  const status = String(rawStatus || "").toLowerCase();
+
+  if (status.includes("open") || status.includes("connect")) return "connected";
+  if (status.includes("close") || status.includes("logout") || status.includes("disconnect")) {
+    return "disconnected";
+  }
+
+  return status || "connecting";
+}
+
+function extractInstanceName(payload: any, req: Request) {
+  const headerInstance = req.headers["x-instance-name"];
+
+  return String(
+    payload?.instance ||
+      payload?.instanceName ||
+      payload?.data?.instance ||
+      payload?.data?.instanceName ||
+      payload?.data?.instanceId ||
+      (Array.isArray(headerInstance) ? headerInstance[0] : headerInstance) ||
+      ""
+  ).trim();
+}
+
+export async function evolutionWebhook(req: Request, res: Response) {
+  try {
+    const payload = req.body;
+
+    const event =
+      payload?.event ||
+      payload?.type ||
+      payload?.data?.event ||
+      "";
+
+    const instanceName = extractInstanceName(payload, req);
+
+    if (isConnectionEvent(event)) {
+      if (!instanceName) {
+        return res.json({ ok: true, ignored: true, reason: "instancia ausente" });
+      }
+
+      const status = normalizeConnectionStatus(payload);
+      const updated = await prisma.whatsappInstance.updateMany({
+        where: { instanceName },
+        data: { status },
+      });
+
+      return res.json({
+        ok: true,
+        event,
+        instanceName,
+        status,
+        updated: updated.count,
+      });
+    }
+
+    if (!isSupportedEvent(event)) {
+      return res.json({ ok: true, ignored: true, reason: "evento não tratado" });
+    }
+
+    const raw =
+      payload?.data?.message ||
+      payload?.data?.messages?.[0] ||
+      payload?.data ||
+      payload;
+
+    const remoteJid =
+      raw?.key?.remoteJidAlt ||
+      raw?.remoteJidAlt ||
+      raw?.key?.remoteJid ||
+      raw?.remoteJid ||
+      raw?.jid ||
+      "";
+
+    const fromMe =
+      raw?.key?.fromMe === true ||
+      raw?.fromMe === true;
+
+    const providerMessageId = raw?.key?.id || null;
+    const phone = normalizePhone((remoteJid || "").split("@")[0]);
+    const text = extractMessageText(raw);
+
+    if (!phone) {
+      return res.json({ ok: true, ignored: true, reason: "telefone ausente" });
+    }
+
+    if (!text) {
+      return res.json({ ok: true, ignored: true, reason: "mensagem sem texto" });
+    }
+
+    if (fromMe) {
+      return res.json({ ok: true, ignored: true, reason: "mensagem do próprio sistema" });
+    }
+
+    let instance = instanceName
+      ? await prisma.whatsappInstance.findUnique({
+          where: { instanceName },
+        })
+      : null;
+
+    if (!instance && !instanceName) {
+      const instances = await prisma.whatsappInstance.findMany({
+        take: 2,
+        orderBy: { createdAt: "asc" },
+      });
+
+      if (instances.length === 1) {
+        instance = instances[0];
+      }
+    }
+
+    if (!instance) {
+      return res.status(400).json({
+        error: "Instancia WhatsApp nao vinculada a uma empresa",
+      });
+    }
+
+    const companyId = instance.companyId;
+
+    let lead = await prisma.lead.findFirst({
+      where: {
+        companyId,
+        phone,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    if (!lead) {
+      lead = await prisma.lead.create({
+        data: {
+          companyId,
+          phone,
+          contactName: null,
+          message: text,
+          stage: "Novo lead",
+        },
+      });
+    } else {
+      await prisma.lead.update({
+        where: { id: lead.id },
+        data: {
+          message: text,
+        },
+      });
+    }
+
+    let conversation = await prisma.conversation.findFirst({
+      where: {
+        companyId,
+        phone,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    if (!conversation) {
+      conversation = await prisma.conversation.create({
+        data: {
+          companyId,
+          leadId: lead.id,
+          contactName: lead.contactName,
+          phone,
+          unreadCount: 1,
+          lastMessageText: text,
+          lastMessageAt: new Date(),
+        },
+      });
+    } else {
+      conversation = await prisma.conversation.update({
+        where: { id: conversation.id },
+        data: {
+          lastMessageText: text,
+          lastMessageAt: new Date(),
+          unreadCount: {
+            increment: 1,
+          },
+        },
+      });
+    }
+
+    const alreadyExists = providerMessageId
+      ? await prisma.message.findFirst({
+          where: {
+            companyId,
+            providerMessageId,
+          },
+        })
+      : null;
+
+    if (!alreadyExists) {
+      await prisma.message.create({
+        data: {
+          companyId,
+          conversationId: conversation.id,
+          direction: "inbound",
+          body: text,
+          status: "received",
+          providerMessageId,
+        },
+      });
+    }
+
+    let aiReply: string | null = null;
+    let aiStatus: string | null = null;
+
+    try {
+      const result = await generateAssistantReply({
+        companyId,
+        conversationId: conversation.id,
+        message: text,
+      });
+
+      if (result.reply && result.enabled) {
+        aiReply = result.reply;
+        aiStatus = result.handoff ? "suggested_handoff" : "sent";
+
+        if (!result.handoff) {
+          try {
+            const sent = await sendEvolutionText(instance.instanceName, phone, result.reply);
+            const providerAiMessageId =
+              sent?.key?.id ||
+              sent?.message?.key?.id ||
+              sent?.data?.key?.id ||
+              null;
+
+            await prisma.message.create({
+              data: {
+                companyId,
+                conversationId: conversation.id,
+                direction: "outbound",
+                body: result.reply,
+                status: "ai_sent",
+                providerMessageId: providerAiMessageId,
+              },
+            });
+
+            await prisma.conversation.update({
+              where: { id: conversation.id },
+              data: {
+                lastMessageText: result.reply,
+                lastMessageAt: new Date(),
+                unreadCount: 0,
+              },
+            });
+          } catch (sendError) {
+            console.error("Erro ao enviar resposta IA:", sendError);
+            aiStatus = "send_failed";
+
+            await prisma.message.create({
+              data: {
+                companyId,
+                conversationId: conversation.id,
+                direction: "outbound",
+                body: result.reply,
+                status: "send_failed",
+              },
+            });
+          }
+        } else {
+          await prisma.message.create({
+            data: {
+              companyId,
+              conversationId: conversation.id,
+              direction: "outbound",
+              body: result.reply,
+              status: "suggested_handoff",
+            },
+          });
+        }
+      }
+    } catch (aiError) {
+      console.error("Erro IA no webhook:", aiError);
+      aiStatus = "error";
+    }
+
+    return res.json({
+      ok: true,
+      companyId,
+      leadId: lead.id,
+      conversationId: conversation.id,
+      aiReply,
+      aiStatus,
+    });
+  } catch (error) {
+    console.error("Erro no evolutionWebhook:", error);
+    return res.status(500).json({ error: "Erro no webhook" });
+  }
+}

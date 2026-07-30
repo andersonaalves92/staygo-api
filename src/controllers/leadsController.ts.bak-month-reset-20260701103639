@@ -1,0 +1,591 @@
+import { Request, Response } from "express";
+import { prisma } from "../lib/prisma";
+import { sendWhatsAppText } from "../lib/whatsappProvider";
+
+function getId(param: any): string { return Array.isArray(param) ? param[0] : param; }
+function onlyDigits(value: any) { return String(value || "").replace(/\D/g, ""); }
+function clean(value: any, fallback = "") { return String(value ?? fallback).trim(); }
+function cents(value: unknown) {
+  const number = Number(String(value || "").replace(",", "."));
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.round(number * 100));
+}
+function moneyFromCents(value: number) {
+  return Number(value || 0) / 100;
+}
+function slugify(value: string) {
+  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "").slice(0, 48) || "empresa";
+}
+async function ensureCompanySlug(companyId: string, name?: string | null) {
+  const company = await prisma.company.findUnique({ where: { id: companyId }, select: { id: true, name: true, publicSlug: true } });
+  if (!company) return "";
+  if (company.publicSlug) return company.publicSlug;
+  const base = slugify(name || company.name);
+  for (let i = 0; i < 20; i++) {
+    const candidate = i === 0 ? base : base + "-" + (i + 1);
+    const exists = await prisma.company.findFirst({ where: { publicSlug: candidate, NOT: { id: companyId } }, select: { id: true } });
+    if (!exists) {
+      await prisma.company.update({ where: { id: companyId }, data: { publicSlug: candidate } });
+      return candidate;
+    }
+  }
+  const fallback = base + "-" + companyId.slice(-6);
+  await prisma.company.update({ where: { id: companyId }, data: { publicSlug: fallback } });
+  return fallback;
+}
+function leadPayload(body: any) {
+  const phone = onlyDigits(body.phone || body.whatsapp || body.telefone);
+  const message = clean(body.message || body.caseDescription || body.caso || body.description, "Lead capturado pela landing page.");
+  return {
+    phone,
+    contactName: clean(body.contactName || body.name || body.nome) || null,
+    message,
+    city: clean(body.city || body.cidade) || null,
+    area: clean(body.area || body.practiceArea || body.tipoCaso) || null,
+    urgency: clean(body.urgency || body.urgencia) || null,
+    source: clean(body.source || body.utm_source || "landing") || null,
+    campaign: clean(body.campaign || body.utm_campaign) || null,
+    keyword: clean(body.keyword || body.utm_term) || null,
+    pageUrl: clean(body.pageUrl || body.url || body.referrer) || null,
+    device: clean(body.device || body.dispositivo) || null,
+    capturedFrom: clean(body.capturedFrom || "landing_page"),
+    stage: clean(body.stage || "novo"),
+    status: clean(body.status || "novo"),
+  };
+}
+function legalUrgencyText(lead: any) {
+  return [lead.urgency, lead.area, lead.message].join(" ").toLowerCase();
+}
+function hasImmediateRisk(lead: any) {
+  const text = legalUrgencyText(lead);
+  return /urgente|agora|preso|prisão|prisao|flagrante|mandado|audiência|audiencia|custódia|custodia|delegacia|habeas|intimação|intimacao|policial|violência|violencia|maria da penha|medida protetiva|ameaça|ameaca/.test(text);
+}
+function calculateLeadScore(lead: any) {
+  const text = legalUrgencyText(lead);
+  let score = 35;
+  if (onlyDigits(lead.phone).length >= 10) score += 10;
+  if (lead.city) score += 8;
+  if (lead.area) score += 12;
+  if (String(lead.message || "").length > 24) score += 12;
+  if (hasImmediateRisk(lead)) score += 23;
+  if (/brasília|brasilia|df/.test(String(lead.city || "").toLowerCase())) score += 5;
+  if (/b\.o|boletim|orientação|orientacao/.test(text)) score += 5;
+  return Math.max(0, Math.min(100, score));
+}
+function isUrgentLead(lead: any) {
+  return hasImmediateRisk(lead);
+}
+function firstName(name: any) {
+  return clean(name).split(/\s+/).filter(Boolean)[0] || "";
+}
+function buildLauraIntakeMessage(lead: any, urgent: boolean) {
+  const name = firstName(lead.contactName);
+  const greeting = name ? "Olá, " + name + "." : "Olá.";
+  const topic = lead.urgency ? " sobre " + String(lead.urgency).toLowerCase() : "";
+  const intro = greeting + " Eu sou a Laura, assistente do escritório.";
+  const text = legalUrgencyText(lead);
+  if (/violência|violencia|maria da penha|medida protetiva|ameaça|ameaca/.test(text)) {
+    return intro + " Recebi seu contato" + topic + ". Sinto muito por você estar passando por isso. Antes de avançar: você está em um local seguro agora?";
+  }
+  if (/habeas|preso|prisão|prisao|flagrante|custódia|custodia/.test(text)) {
+    return intro + " Recebi seu contato" + topic + " e vou organizar para o advogado. Quem está preso ou com audiência marcada agora?";
+  }
+  if (/intimação|intimacao|policial|delegacia/.test(text)) {
+    return intro + " Recebi seu contato" + topic + " e vou organizar para o advogado. A intimação é para qual data?";
+  }
+  if (urgent) {
+    return intro + " Recebi seu contato e vou priorizar. Me conta um pouco mais sobre o que aconteceu?";
+  }
+  return intro + " Recebi seu contato" + topic + ". Me conta um pouco mais sobre o que aconteceu para eu organizar melhor para o advogado.";
+}
+function buildLeadSummary(lead: any) {
+  return [
+    lead.contactName ? "Nome: " + lead.contactName : "Nome: não informado",
+    lead.phone ? "WhatsApp: " + lead.phone : "WhatsApp: não informado",
+    lead.city ? "Cidade: " + lead.city : "Cidade: não informada",
+    lead.area ? "Tipo de caso: " + lead.area : "Tipo de caso: não informado",
+    lead.urgency ? "Urgência: " + lead.urgency : "Urgência: não informada",
+    lead.message ? "Relato: " + lead.message : "Relato: não informado",
+    lead.source ? "Origem: " + lead.source : "Origem: landing",
+    lead.campaign ? "Campanha: " + lead.campaign : "",
+    lead.keyword ? "Termo: " + lead.keyword : "",
+  ].filter(Boolean).join("\n");
+}
+function buildLawyerHandoffText(company: any, lead: any, score: number, urgent: boolean) {
+  const action = urgent || score >= 80
+    ? "Acionar agora. Lead com sinal de urgência ou alta intenção."
+    : "Responder assim que possível. Lead já organizado pela Laura.";
+  return [
+    "Novo lead capturado pelo StayGoBot",
+    "",
+    "Empresa: " + (company.name || "escritório"),
+    "Score: " + score + "/100" + (urgent ? " - urgente" : ""),
+    "Ação sugerida: " + action,
+    "",
+    buildLeadSummary(lead),
+    "",
+    "Mensagem curta sugerida:",
+    "Olá, aqui é do escritório. Recebi seu contato pelo atendimento da Laura. Pode me contar em uma frase o que aconteceu agora?",
+  ].filter(Boolean).join("\n");
+}
+async function createLeadConversation(companyId: string, lead: any, score: number, urgent: boolean) {
+  const tags = ["landing", "laura", urgent ? "urgente" : "triagem", score >= 80 ? "lead_score_alto" : "lead_score_medio"].join(", ");
+  const summary = buildLeadSummary(lead);
+  const conversation = await prisma.conversation.create({
+    data: {
+      companyId,
+      leadId: lead.id,
+      contactName: lead.contactName,
+      phone: lead.phone,
+      tags,
+      notes: "Lead capturado pela landing pública.\n\n" + summary,
+      unreadCount: 1,
+      lastMessageText: lead.message,
+      lastMessageAt: new Date(),
+      isHot: urgent || score >= 80,
+      followUpStatus: "none",
+    },
+  });
+  await prisma.message.createMany({ data: [
+    { companyId, conversationId: conversation.id, direction: "inbound", body: lead.message, status: "received" },
+    { companyId, conversationId: conversation.id, direction: "system", body: buildLauraIntakeMessage(lead, urgent), status: "ai_intake" },
+  ] });
+  return conversation;
+}
+
+async function findLeadForwardingInstance(companyId: string) {
+  const instances = await prisma.whatsappInstance.findMany({
+    where: { companyId },
+    orderBy: { createdAt: "asc" },
+  });
+  return (
+    instances.find((instance) =>
+      instance.provider === "meta_cloud_api" &&
+      Boolean(instance.metaPhoneNumberId) &&
+      Boolean(instance.metaAccessToken)
+    ) ||
+    instances.find((instance) =>
+      instance.provider !== "meta_cloud_api" &&
+      String(instance.status || "").toLowerCase() === "connected"
+    ) ||
+    null
+  );
+}
+
+async function forwardLeadToAttorney(company: any, lead: any, conversationId: string, score: number, urgent: boolean) {
+  const destination = onlyDigits(company.leadWhatsappNumber);
+  if (!destination) {
+    await prisma.message.create({
+      data: {
+        companyId: company.id,
+        conversationId,
+        direction: "system",
+        body: "Repasse manual pendente: configure o WhatsApp do advogado para usar o botão de encaminhamento.",
+        status: "internal_handoff_pending",
+      },
+    });
+    return { status: "no_destination", provider: null, providerMessageId: null };
+  }
+
+  const instance = await findLeadForwardingInstance(company.id);
+  if (!instance) {
+    await prisma.message.create({
+      data: {
+        companyId: company.id,
+        conversationId,
+        direction: "system",
+        body: "Lead pronto para o advogado. Use o botão Abrir WhatsApp para enviar o resumo já preenchido.",
+        status: "internal_handoff_ready",
+      },
+    });
+    return { status: "no_instance", provider: null, providerMessageId: null };
+  }
+
+  const text = buildLawyerHandoffText(company, lead, score, urgent);
+  try {
+    const sent = await sendWhatsAppText(instance, destination, text);
+    await prisma.message.create({
+      data: {
+        companyId: company.id,
+        conversationId,
+        direction: "system",
+        body: "Laura encaminhou este lead automaticamente para o WhatsApp do advogado: " + destination,
+        status: "internal_handoff_sent",
+        providerMessageId: sent?.id || null,
+      },
+    });
+    return { status: "sent", provider: sent?.provider || instance.provider, providerMessageId: sent?.id || null };
+  } catch (error: any) {
+    console.error("Erro forwardLeadToAttorney:", error);
+    await prisma.message.create({
+      data: {
+        companyId: company.id,
+        conversationId,
+        direction: "system",
+        body: "Lead pronto para repasse manual. O envio automático falhou e o botão Abrir WhatsApp mantém o resumo disponível.",
+        status: "internal_handoff_ready",
+      },
+    });
+    return { status: "failed", provider: instance.provider, providerMessageId: null, error: error?.message || "erro desconhecido" };
+  }
+}
+
+function whatsappUrl(phone: string, lead: any) {
+  const to = onlyDigits(phone);
+  if (!to) return "";
+  const lines = [
+    "Novo lead vindo pelo StayGoBot.",
+    lead.contactName ? "Nome: " + lead.contactName : "",
+    lead.phone ? "Telefone: " + lead.phone : "",
+    lead.city ? "Cidade: " + lead.city : "",
+    lead.area ? "Tipo de caso: " + lead.area : "",
+    lead.urgency ? "Urgência: " + lead.urgency : "",
+    lead.message ? "Resumo: " + lead.message : "",
+    lead.source ? "Origem: " + lead.source : "",
+    lead.campaign ? "Campanha: " + lead.campaign : "",
+    lead.keyword ? "Termo: " + lead.keyword : "",
+  ].filter(Boolean);
+  return "https://wa.me/" + to + "?text=" + encodeURIComponent(lines.join("\n"));
+}
+
+export async function createLead(req: Request, res: Response) {
+  try {
+    const companyId = req.auth!.companyId;
+    const payload = leadPayload(req.body || {});
+    if (!payload.phone) return res.status(400).json({ error: "Informe o telefone do lead." });
+    const lead = await prisma.lead.create({ data: { ...payload, companyId } });
+    return res.json(lead);
+  } catch (error) {
+    console.error("Erro createLead:", error);
+    return res.status(500).json({ error: "Erro ao criar lead." });
+  }
+}
+
+export async function listLeads(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const leads = await prisma.lead.findMany({ where: { companyId }, orderBy: { createdAt: "desc" } });
+  return res.json(leads);
+}
+
+export async function getLeadFunnel(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const leads = await prisma.lead.groupBy({ by: ["stage"], where: { companyId }, _count: { _all: true } });
+  return res.json(leads.map((row) => ({ stage: row.stage, total: row._count._all })));
+}
+
+export async function listConversations(_req: Request, res: Response) { return res.json([]); }
+
+export async function updateLeadStage(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const id = getId(req.params.id);
+  const { stage } = req.body;
+  const result = await prisma.lead.updateMany({ where: { id, companyId }, data: { stage: clean(stage || "novo") } });
+  if (result.count === 0) return res.status(404).json({ error: "Lead nao encontrado" });
+  const lead = await prisma.lead.findFirst({ where: { id, companyId } });
+  return res.json(lead);
+}
+
+export async function getCaptureSettings(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const company = await prisma.company.findUnique({ where: { id: companyId }, select: { id: true, name: true, publicSlug: true, leadWhatsappNumber: true, leadReportEmail: true } });
+  if (!company) return res.status(404).json({ error: "Empresa nao encontrada." });
+  const publicSlug = await ensureCompanySlug(company.id, company.name);
+  return res.json({ ...company, publicSlug, publicLeadUrl: "/capturar/" + publicSlug, apiEndpoint: "/api/public/capture/" + publicSlug + "/leads" });
+}
+
+export async function saveCaptureSettings(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const body = req.body || {};
+  const current = await prisma.company.findUnique({ where: { id: companyId }, select: { id: true, name: true } });
+  if (!current) return res.status(404).json({ error: "Empresa nao encontrada." });
+  let publicSlug = clean(body.publicSlug);
+  if (!publicSlug) publicSlug = await ensureCompanySlug(companyId, current.name);
+  publicSlug = slugify(publicSlug);
+  const exists = await prisma.company.findFirst({ where: { publicSlug, NOT: { id: companyId } }, select: { id: true } });
+  if (exists) return res.status(409).json({ error: "Este slug publico ja esta em uso." });
+  const company = await prisma.company.update({ where: { id: companyId }, data: { publicSlug, leadWhatsappNumber: onlyDigits(body.leadWhatsappNumber), leadReportEmail: clean(body.leadReportEmail) }, select: { id: true, name: true, publicSlug: true, leadWhatsappNumber: true, leadReportEmail: true } });
+  return res.json({ ...company, publicLeadUrl: "/capturar/" + company.publicSlug, apiEndpoint: "/api/public/capture/" + company.publicSlug + "/leads" });
+}
+
+export async function getAdsWorkspace(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    select: { id: true, name: true, publicSlug: true, leadWhatsappNumber: true, leadReportEmail: true },
+  });
+  if (!company) return res.status(404).json({ error: "Empresa nao encontrada." });
+  const publicSlug = await ensureCompanySlug(company.id, company.name);
+  const config = await prisma.adsWorkspaceConfig.findUnique({ where: { companyId } });
+  return res.json({
+    company: { ...company, publicSlug },
+    capture: {
+      publicLeadUrl: "/capturar/" + publicSlug,
+      apiEndpoint: "/api/public/capture/" + publicSlug + "/leads",
+    },
+    config: config ? { ...config, dailyBudget: moneyFromCents(config.dailyBudgetCents) } : null,
+  });
+}
+
+export async function saveAdsWorkspace(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const body = req.body || {};
+  const current = await prisma.company.findUnique({ where: { id: companyId }, select: { id: true, name: true } });
+  if (!current) return res.status(404).json({ error: "Empresa nao encontrada." });
+
+  let publicSlug = clean(body.publicSlug);
+  if (!publicSlug) publicSlug = await ensureCompanySlug(companyId, current.name);
+  publicSlug = slugify(publicSlug);
+
+  const exists = await prisma.company.findFirst({ where: { publicSlug, NOT: { id: companyId } }, select: { id: true } });
+  if (exists) return res.status(409).json({ error: "Este slug publico ja esta em uso." });
+
+  await prisma.company.update({
+    where: { id: companyId },
+    data: {
+      publicSlug,
+      leadWhatsappNumber: onlyDigits(body.leadWhatsappNumber),
+      leadReportEmail: clean(body.leadReportEmail),
+    },
+  });
+
+  const config = await prisma.adsWorkspaceConfig.upsert({
+    where: { companyId },
+    update: {
+      finalUrl: clean(body.finalUrl),
+      campaignName: clean(body.campaignName),
+      keywordTemplate: clean(body.keywordTemplate || body.keyword || "{keyword}"),
+      dailyBudgetCents: cents(body.dailyBudget),
+      adTitle: clean(body.adTitle),
+      adDescription: clean(body.adDescription),
+      adCallout: clean(body.adCallout),
+      manualWhatsappLink: clean(body.manualWhatsappLink),
+      googleApplyStatus: "saved_in_staygobot",
+      googleApplyNote: "Configuracao salva no StayGoBot. Aplicacao direta no Google Ads depende da liberacao da Google Ads API para escrita.",
+    },
+    create: {
+      companyId,
+      finalUrl: clean(body.finalUrl),
+      campaignName: clean(body.campaignName),
+      keywordTemplate: clean(body.keywordTemplate || body.keyword || "{keyword}"),
+      dailyBudgetCents: cents(body.dailyBudget),
+      adTitle: clean(body.adTitle),
+      adDescription: clean(body.adDescription),
+      adCallout: clean(body.adCallout),
+      manualWhatsappLink: clean(body.manualWhatsappLink),
+      googleApplyStatus: "saved_in_staygobot",
+      googleApplyNote: "Configuracao salva no StayGoBot. Aplicacao direta no Google Ads depende da liberacao da Google Ads API para escrita.",
+    },
+  });
+
+  return res.json({ ok: true, config: { ...config, dailyBudget: moneyFromCents(config.dailyBudgetCents) } });
+}
+
+export async function getPublicCaptureConfig(req: Request, res: Response) {
+  const slug = clean(req.params.slug).toLowerCase();
+  const company = await prisma.company.findFirst({ where: { publicSlug: slug, status: "active" }, select: { name: true, publicSlug: true } });
+  if (!company) return res.status(404).json({ error: "Página nao encontrada." });
+  return res.json({ companyName: company.name, publicSlug: company.publicSlug });
+}
+
+export async function createPublicLead(req: Request, res: Response) {
+  try {
+    const slug = clean(req.params.slug).toLowerCase();
+    const company = await prisma.company.findFirst({ where: { publicSlug: slug, status: "active" }, select: { id: true, name: true, leadWhatsappNumber: true } });
+    if (!company) return res.status(404).json({ error: "Empresa não encontrada." });
+    const payload = leadPayload({ ...(req.body || {}), capturedFrom: "public_landing" });
+    if (!payload.phone) return res.status(400).json({ error: "Informe seu WhatsApp para continuar." });
+    const score = calculateLeadScore(payload);
+    const urgent = isUrgentLead(payload);
+    const stage = urgent ? "urgente" : score >= 75 ? "em triagem" : "encaminhado";
+    const lead = await prisma.lead.create({
+      data: {
+        ...payload,
+        companyId: company.id,
+        stage,
+        status: "encaminhado",
+        whatsappClickedAt: new Date(),
+        leadScore: score,
+        qualityScore: Math.round(score / 10),
+        qualificationNotes: "Triagem pública StayGoBot. Score inicial: " + score + "/100.\n\n" + buildLeadSummary(payload),
+      },
+    });
+    const conversation = await createLeadConversation(company.id, lead, score, urgent);
+    const handoff = await forwardLeadToAttorney(company, lead, conversation.id, score, urgent);
+    return res.json({
+      ok: true,
+      leadId: lead.id,
+      conversationId: conversation.id,
+      leadScore: score,
+      urgent,
+      handoff,
+      whatsappUrl: whatsappUrl(company.leadWhatsappNumber, lead),
+      message: handoff.status === "sent" ? "Lead registrado e encaminhado ao advogado." : "Lead registrado no StayGoBot.",
+    });
+  } catch (error) {
+    console.error("Erro createPublicLead:", error);
+    return res.status(500).json({ error: "Não foi possível registrar o lead." });
+  }
+}
+
+
+function numberOrNull(value: any) {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(String(value).replace(",", "."));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function dateOrNull(value: any) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+const RESOLVED_QUALIFICATION_STATUSES = ["qualificado", "consulta_marcada", "contratado", "perdido", "ruim"];
+
+function removeAlertTags(current: string | null | undefined) {
+  return String(current || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item && !["alerta_humano", "urgente", "advogado_agir"].includes(item.toLowerCase()))
+    .join(", ");
+}
+
+async function clearLeadConversationAlerts(companyId: string, leadId: string) {
+  const conversations = await prisma.conversation.findMany({
+    where: { companyId, leadId },
+    select: { id: true, tags: true },
+  });
+
+  await Promise.all(
+    conversations.map((conversation) =>
+      prisma.conversation.update({
+        where: { id: conversation.id },
+        data: {
+          isHot: false,
+          unreadCount: 0,
+          tags: removeAlertTags(conversation.tags),
+          followUpAt: null,
+          followUpText: "",
+          followUpStatus: "none",
+          followUpSentAt: null,
+        },
+      })
+    )
+  );
+}
+
+export async function registerManualWhatsappHandoff(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const id = getId(req.params.id);
+  const lead = await prisma.lead.findFirst({ where: { id, companyId } });
+  if (!lead) return res.status(404).json({ error: "Lead nao encontrado" });
+
+  const updatedLead = await prisma.lead.update({
+    where: { id },
+    data: {
+      status: "encaminhado_whatsapp",
+      stage: lead.stage === "urgente" ? "em atendimento" : lead.stage,
+      whatsappClickedAt: new Date(),
+      qualificationNotes: [
+        lead.qualificationNotes || "",
+        "Encaminhado manualmente pelo StayGoBot para WhatsApp do lead em " + new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" }) + ".",
+      ].filter(Boolean).join("\n\n"),
+    },
+  });
+
+  await clearLeadConversationAlerts(companyId, id);
+  await prisma.message.createMany({
+    data: (await prisma.conversation.findMany({ where: { companyId, leadId: id }, select: { id: true } })).map((conversation) => ({
+      companyId,
+      conversationId: conversation.id,
+      direction: "system",
+      status: "internal_manual_whatsapp_opened",
+      body: "Advogado abriu o WhatsApp do lead pelo StayGoBot.",
+    })),
+  });
+
+  return res.json({ ok: true, lead: updatedLead });
+}
+
+export async function updateLeadQualification(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const id = getId(req.params.id);
+  const body = req.body || {};
+  const data: any = {
+    qualificationStatus: clean(body.qualificationStatus || "nao_qualificado"),
+    lossReason: clean(body.lossReason) || null,
+    qualificationNotes: clean(body.qualificationNotes) || null,
+  };
+  const qualityScore = numberOrNull(body.qualityScore);
+  const leadScore = numberOrNull(body.leadScore);
+  const potentialValue = numberOrNull(body.potentialValue);
+  const closedValue = numberOrNull(body.closedValue);
+  if (qualityScore !== null) data.qualityScore = Math.max(0, Math.min(10, Math.round(qualityScore)));
+  if (leadScore !== null) data.leadScore = Math.max(0, Math.min(100, Math.round(leadScore)));
+  if (potentialValue !== null) data.potentialValue = potentialValue;
+  if (closedValue !== null) data.closedValue = closedValue;
+  data.appointmentAt = dateOrNull(body.appointmentAt);
+  data.contractedAt = dateOrNull(body.contractedAt);
+  if (data.qualificationStatus === "contratado" && !data.contractedAt) data.contractedAt = new Date();
+  const stageByStatus: Record<string, string> = { qualificado: "em triagem", consulta_marcada: "consulta marcada", contratado: "contratado", perdido: "perdido", ruim: "perdido" };
+  if (stageByStatus[data.qualificationStatus]) data.stage = stageByStatus[data.qualificationStatus];
+  const result = await prisma.lead.updateMany({ where: { id, companyId }, data });
+  if (result.count === 0) return res.status(404).json({ error: "Lead nao encontrado" });
+  if (RESOLVED_QUALIFICATION_STATUSES.includes(data.qualificationStatus)) {
+    await clearLeadConversationAlerts(companyId, id);
+  }
+  const lead = await prisma.lead.findFirst({ where: { id, companyId } });
+  return res.json(lead);
+}
+
+export async function getLeadIntelligence(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const since = new Date(Date.now() - 30 * 86400000);
+  const leads = await prisma.lead.findMany({ where: { companyId, createdAt: { gte: since } }, orderBy: { createdAt: "desc" } });
+  const total = leads.length;
+  const qualified = leads.filter((l) => ["qualificado", "consulta_marcada", "contratado"].includes(l.qualificationStatus)).length;
+  const contracted = leads.filter((l) => l.qualificationStatus === "contratado" || l.stage === "contratado").length;
+  const lost = leads.filter((l) => ["perdido", "ruim"].includes(l.qualificationStatus) || l.stage === "perdido").length;
+  const urgent = leads.filter((l) => String(l.urgency || "").toLowerCase().includes("urg") || l.stage === "urgente").length;
+  const closedRevenue = leads.reduce((sum, lead: any) => sum + Number(lead.closedValue || 0), 0);
+  const byCampaign = new Map<string, any>();
+  const byLoss = new Map<string, number>();
+  const byKeyword = new Map<string, any>();
+  for (const lead of leads as any[]) {
+    const campaign = lead.campaign || lead.source || "sem origem";
+    const keyword = lead.keyword || "sem termo";
+    const loss = lead.lossReason || "sem motivo";
+    const c = byCampaign.get(campaign) || { name: campaign, leads: 0, qualified: 0, contracted: 0, lost: 0, revenue: 0 };
+    c.leads++;
+    if (["qualificado", "consulta_marcada", "contratado"].includes(lead.qualificationStatus)) c.qualified++;
+    if (lead.qualificationStatus === "contratado" || lead.stage === "contratado") c.contracted++;
+    if (["perdido", "ruim"].includes(lead.qualificationStatus) || lead.stage === "perdido") c.lost++;
+    c.revenue += Number(lead.closedValue || 0);
+    byCampaign.set(campaign, c);
+    const k = byKeyword.get(keyword) || { name: keyword, leads: 0, qualified: 0, contracted: 0, lost: 0 };
+    k.leads++;
+    if (["qualificado", "consulta_marcada", "contratado"].includes(lead.qualificationStatus)) k.qualified++;
+    if (lead.qualificationStatus === "contratado" || lead.stage === "contratado") k.contracted++;
+    if (["perdido", "ruim"].includes(lead.qualificationStatus) || lead.stage === "perdido") k.lost++;
+    byKeyword.set(keyword, k);
+    if (["perdido", "ruim"].includes(lead.qualificationStatus) || lead.stage === "perdido") byLoss.set(loss, (byLoss.get(loss) || 0) + 1);
+  }
+  const campaigns = Array.from(byCampaign.values()).sort((a, b) => b.contracted - a.contracted || b.qualified - a.qualified || b.leads - a.leads);
+  const keywords = Array.from(byKeyword.values()).sort((a, b) => b.lost - a.lost || b.leads - a.leads).slice(0, 12);
+  const lossReasons = Array.from(byLoss.entries()).map(([reason, total]) => ({ reason, total })).sort((a, b) => b.total - a.total);
+  const recommendations: string[] = [];
+  if (total && qualified / total < 0.35) recommendations.push("A taxa de qualificação está baixa. Revise termos de busca, promessa da landing page e perguntas do formulário.");
+  if (lossReasons[0]?.reason && lossReasons[0].reason !== "sem motivo") recommendations.push("Principal motivo de perda: " + lossReasons[0].reason + ". Use isso para negativar termos e ajustar a oferta.");
+  if (campaigns[0]?.contracted > 0) recommendations.push("Campanha com melhor sinal de contrato: " + campaigns[0].name + ". Priorize orçamento e variações próximas.");
+  if (!recommendations.length) recommendations.push("Ainda faltam dados de qualificação. Marque leads como qualificado, perdido ou contratado para o algoritmo comercial aprender.");
+  return res.json({ period: "30 dias", total, qualified, contracted, lost, urgent, closedRevenue, qualificationRate: total ? Math.round((qualified / total) * 100) : 0, contractRate: total ? Math.round((contracted / total) * 100) : 0, campaigns, keywords, lossReasons, recommendations });
+}
+
+export async function exportOfflineConversions(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const leads = await prisma.lead.findMany({ where: { companyId, OR: [{ qualificationStatus: "contratado" }, { stage: "contratado" }] }, orderBy: { createdAt: "desc" } });
+  const header = ["lead_id", "phone", "contact_name", "campaign", "keyword", "conversion_name", "conversion_time", "conversion_value", "currency"].join(",");
+  const rows = leads.map((lead: any) => [lead.id, lead.phone, lead.contactName || "", lead.campaign || "", lead.keyword || "", "Contrato fechado", (lead.contractedAt || lead.createdAt).toISOString(), Number(lead.closedValue || lead.potentialValue || 0).toFixed(2), "BRL"].map((value) => '"' + String(value).replace(/"/g, '""') + '"').join(","));
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", "attachment; filename=conversoes-offline-staygobot.csv");
+  return res.send([header, ...rows].join("\\n"));
+}

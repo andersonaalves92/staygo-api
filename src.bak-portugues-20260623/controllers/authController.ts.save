@@ -1,0 +1,212 @@
+import { Request, Response } from "express";
+import bcrypt from "bcryptjs";
+import { prisma } from "../lib/prisma";
+import { signSessionToken } from "../lib/jwt";
+
+async function ensureDefaultStages(companyId: string) {
+  const count = await prisma.pipelineStage.count({
+    where: { companyId },
+  });
+
+  if (count > 0) return;
+
+  await prisma.pipelineStage.createMany({
+    data: [
+      { companyId, name: "Novo lead", position: 0, color: "#2563eb" },
+      { companyId, name: "Contato iniciado", position: 1, color: "#7c3aed" },
+      { companyId, name: "Proposta enviada", position: 2, color: "#f59e0b" },
+      { companyId, name: "Aguardando resposta", position: 3, color: "#0ea5e9" },
+      { companyId, name: "Fechado", position: 4, color: "#16a34a" },
+      { companyId, name: "Perdido", position: 5, color: "#dc2626" },
+    ],
+  });
+}
+
+//
+// 🔥 REGISTER
+//
+export async function register(req: Request, res: Response) {
+  try {
+    const { email, password, companyName } = req.body;
+
+    if (!email || !password || !companyName) {
+      return res.status(400).json({ error: "Campos obrigatórios" });
+    }
+
+    const existing = await prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (existing) {
+      return res.status(400).json({ error: "E-mail já existe" });
+    }
+
+    // 🔥 cria tenant (subdomínio futuro)
+    const tenant = await prisma.tenant.create({
+      data: {
+        name: companyName,
+        domain: companyName.toLowerCase().replace(/\s+/g, "-"),
+      },
+    });
+
+    // 🔥 cria empresa
+    const company = await prisma.company.create({
+      data: {
+        name: companyName,
+      },
+    });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // 🔥 CRIA USER CORRETO
+    const user = await prisma.user.create({
+  data: {
+    name: companyName, // 👈 ou req.body.name se tiver
+    email,
+    passwordHash,
+
+    tenant: {
+      connect: { id: tenant.id },
+    },
+
+    memberships: {
+      create: {
+        companyId: company.id,
+        role: "owner",
+      },
+    },
+  },
+});
+
+        // ✅ RELATION (não usar tenantId)
+        tenant: {
+          connect: { id: tenant.id },
+        },
+
+        memberships: {
+          create: {
+            companyId: company.id,
+            role: "owner",
+          },
+        },
+      },
+    });
+
+    await ensureDefaultStages(company.id);
+
+    const token = signSessionToken({
+      userId: user.id,
+      companyId: company.id,
+      role: "owner",
+    });
+
+    res.cookie("session_token", token, {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    return res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+      },
+      company,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no registro" });
+  }
+}
+
+//
+// 🔥 LOGIN
+//
+export async function login(req: Request, res: Response) {
+  try {
+    const { email, password } = req.body;
+
+    const user = await prisma.user.findUnique({
+      where: { email },
+      include: {
+        memberships: {
+          include: { company: true },
+        },
+      },
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: "Credenciais inválidas" });
+    }
+
+    const valid = await bcrypt.compare(password, user.passwordHash);
+
+    if (!valid) {
+      return res.status(401).json({ error: "Credenciais inválidas" });
+    }
+
+    const membership = user.memberships[0];
+
+    const token = signSessionToken({
+      userId: user.id,
+      companyId: membership.companyId,
+      role: membership.role,
+    });
+
+    res.cookie("session_token", token, {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    return res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+      },
+      company: membership.company,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no login" });
+  }
+}
+
+//
+// 🔥 ME
+//
+export async function me(req: Request, res: Response) {
+  try {
+    if (!req.auth) {
+      return res.status(401).json({ error: "Não autenticado" });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.auth.userId },
+    });
+
+    const company = await prisma.company.findUnique({
+      where: { id: req.auth.companyId },
+    });
+
+    return res.json({
+      user,
+      company,
+      role: req.auth.role,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Erro no me" });
+  }
+}
+
+//
+// 🔥 LOGOUT
+//
+export async function logout(_req: Request, res: Response) {
+  res.clearCookie("session_token");
+  res.json({ ok: true });
+}

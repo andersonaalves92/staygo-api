@@ -1,0 +1,19 @@
+import { Router } from "express";
+import {
+  createLead,
+  listLeads,
+  updateLeadStage,
+  getLeadFunnel,
+  listConversations,
+} from "../controllers/leadsController";
+import { requireAuth } from "../middlewares/authMiddleware";
+
+export const leadsRoutes = Router();
+
+leadsRoutes.use(requireAuth);
+
+leadsRoutes.post("/", createLead);
+leadsRoutes.get("/", listLeads);
+leadsRoutes.get("/funnel", getLeadFunnel);
+leadsRoutes.get("/conversations", listConversations);
+leadsRoutes.patch("/:id/stage", updateLeadStage);

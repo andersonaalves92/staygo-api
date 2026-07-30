@@ -1,0 +1,272 @@
+conversation.create({
+      data: {
+        companyId,
+        leadId: lead2.id,
+        contactName: lead2.contactName,
+        phone: lead2.phone,
+        stageId: firstStage?.id,
+        tags: "pet,casal",
+        notes: "Perguntou se aceita pet",
+        unreadCount: 1,
+        isHot: false,
+        lastMessageText: "Aceita pet?",
+        lastMessageAt: new Date(),
+      },
+    });
+
+    await prisma.message.createMany({
+      data: [
+        {
+          companyId,
+          conversationId: conversation1.id,
+          direction: "inbound",
+          body: "Tem casa com piscina para julho?",
+          status: "received",
+        },
+        {
+          companyId,
+          conversationId: conversation1.id,
+          direction: "outbound",
+          body: "Temos sim. Me diga a data e quantidade de hóspedes.",
+          status: "sent",
+        },
+        {
+          companyId,
+          conversationId: conversation2.id,
+          direction: "inbound",
+          body: "Aceita pet?",
+          status: "received",
+        },
+      ],
+    });
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Erro em seedConversations:", error);
+    return res.status(500).json({ error: "Erro ao criar seed de conversas" });
+  }
+}
+
+export async function listStages(req: Request, res: Response) {
+  try {
+    const companyId = req.auth!.companyId;
+
+    const stages = await prisma.pipelineStage.findMany({
+      where: { companyId },
+      orderBy: { position: "asc" },
+    });
+
+    return res.json(stages);
+  } catch (error) {
+    console.error("Erro em listStages:", error);
+    return res.status(500).json({ error: "Erro ao listar etapas" });
+  }
+}
+
+export async function listConversations(req: Request, res: Response) {
+  try {
+    const companyId = req.auth!.companyId;
+    const { q, unreadOnly, stageId, assignedUserId } = req.query;
+
+    const conversations = await prisma.conversation.findMany({
+      where: {
+        companyId,
+        ...(assignedUserId ? { assignedUserId: String(assignedUserId) } : {}),
+        ...(q
+          ? {
+              OR: [
+                { contactName: { contains: String(q), mode: "insensitive" } },
+                { phone: { contains: String(q) } },
+                { lastMessageText: { contains: String(q), mode: "insensitive" } },
+              ],
+            }
+          : {}),
+        ...(unreadOnly === "true" ? { unreadCount: { gt: 0 } } : {}),
+        ...(stageId ? { stageId: String(stageId) } : {}),
+      },
+      include: {
+        stage: true,
+        assignedUser: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+      orderBy: [
+        { lastMessageAt: "desc" },
+        { updatedAt: "desc" },
+      ],
+    });
+
+    return res.json(conversations);
+  } catch (error) {
+    console.error("Erro em listConversations:", error);
+    return res.status(500).json({ error: "Erro ao listar conversas" });
+  }
+}
+
+export async function getConversationById(req: Request, res: Response) {
+  try {
+    const companyId = req.auth!.companyId;
+    const { id } = req.params;
+
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        id,
+        companyId,
+      },
+      include: {
+        stage: true,
+        lead: true,
+        assignedUser: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        messages: {
+          orderBy: {
+            createdAt: "asc",
+          },
+        },
+      },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversa não encontrada" });
+    }
+
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: {
+        unreadCount: 0,
+      },
+    });
+
+    return res.json(conversation);
+  } catch (error) {
+    console.error("Erro em getConversationById:", error);
+    return res.status(500).json({ error: "Erro ao buscar conversa" });
+  }
+}
+
+export async function sendMessage(req: Request, res: Response) {
+  try {
+    const companyId = req.auth!.companyId;
+    const { id } = req.params;
+    const { body } = req.body;
+
+    if (!body || !String(body).trim()) {
+      return res.status(400).json({ error: "Mensagem obrigatória" });
+    }
+
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        id,
+        companyId,
+      },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversa não encontrada" });
+    }
+
+    const evoResult = await sendViaEvolution(conversation.phone, String(body));
+
+    const message = await prisma.message.create({
+      data: {
+        companyId,
+        conversationId: conversation.id,
+        direction: "outbound",
+        body: String(body),
+        status: evoResult.status,
+        providerMessageId: evoResult.providerMessageId,
+      },
+    });
+
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: {
+        lastMessageText: String(body),
+        lastMessageAt: new Date(),
+      },
+    });
+
+    return res.status(201).json(message);
+  } catch (error) {
+    console.error("Erro em sendMessage:", error);
+    return res.status(500).json({ error: "Erro ao enviar mensagem" });
+  }
+}
+
+export async function updateConversation(req: Request, res: Response) {
+  try {
+    const companyId = req.auth!.companyId;
+    const { id } = req.params;
+
+    const {
+      contactName,
+      stageId,
+      tags,
+      notes,
+      isHot,
+      assignedUserId,
+    } = req.body;
+
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        id,
+        companyId,
+      },
+      include: {
+        lead: true,
+      },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversa não encontrada" });
+    }
+
+    const updatedConversation = await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: {
+        ...(contactName !== undefined ? { contactName } : {}),
+        ...(stageId !== undefined ? { stageId: stageId || null } : {}),
+        ...(tags !== undefined ? { tags } : {}),
+        ...(notes !== undefined ? { notes } : {}),
+        ...(isHot !== undefined ? { isHot: Boolean(isHot) } : {}),
+        ...(assignedUserId !== undefined
+          ? { assignedUserId: assignedUserId || null }
+          : {}),
+      },
+      include: {
+        stage: true,
+        lead: true,
+        assignedUser: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    if (conversation.leadId) {
+      await prisma.lead.update({
+        where: { id: conversation.leadId },
+        data: {
+          ...(contactName !== undefined ? { contactName } : {}),
+          ...(stageId !== undefined
+            ? { stage: updatedConversation.stage?.name || "novo" }
+            : {}),
+        },
+      });
+    }
+
+    return res.json(updatedConversation);
+  } catch (error) {
+    console.error("Erro em updateConversation:", error);
+    return res.status(500).json({ error: "Erro ao atualizar conversa" });
+  }
+}

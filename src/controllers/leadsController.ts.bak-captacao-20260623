@@ -1,0 +1,63 @@
+import { Request, Response } from "express";
+import { prisma } from "../lib/prisma";
+
+function getId(param: any): string {
+  return Array.isArray(param) ? param[0] : param;
+}
+
+export async function createLead(req: Request, res: Response) {
+  try {
+    const companyId = req.auth!.companyId;
+
+    const lead = await prisma.lead.create({
+      data: {
+        ...req.body,
+        stage: req.body.stage || "Novo lead",
+        companyId,
+      },
+    });
+
+    return res.json(lead);
+  } catch {
+    return res.status(500).json({ error: "Erro" });
+  }
+}
+
+export async function listLeads(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+
+  const leads = await prisma.lead.findMany({
+    where: { companyId },
+  });
+
+  return res.json(leads);
+}
+
+export async function getLeadFunnel(req: Request, res: Response) {
+  return res.json([]);
+}
+
+export async function listConversations(req: Request, res: Response) {
+  return res.json([]);
+}
+
+export async function updateLeadStage(req: Request, res: Response) {
+  const companyId = req.auth!.companyId;
+  const id = getId(req.params.id);
+  const { stage } = req.body;
+
+  const result = await prisma.lead.updateMany({
+    where: { id, companyId },
+    data: { stage },
+  });
+
+  if (result.count === 0) {
+    return res.status(404).json({ error: "Lead nao encontrado" });
+  }
+
+  const lead = await prisma.lead.findFirst({
+    where: { id, companyId },
+  });
+
+  return res.json(lead);
+}

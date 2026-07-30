@@ -1,0 +1,348 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  domain    String   @unique
+  users     User[]
+  createdAt DateTime @default(now())
+}
+
+model User {
+  id           String  @id @default(uuid())
+  email        String  @unique
+  passwordHash String // 🔥 corrigido (antes era password)
+  name         String // 🔥 necessário pro seu controller
+  avatarUrl    String? // 🔥 opcional
+  isActive     Boolean @default(true)
+  isPlatformAdmin Boolean @default(false)
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  memberships Membership[]
+  invitationsSent TeamInvitation[] @relation("InvitedByUser")
+
+  assignedConversations Conversation[] @relation("AssignedUserConversations")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Company {
+  id        String   @id @default(cuid())
+  name      String
+  plan      String   @default("trial")
+  planName  String   @default("Trial")
+  expiresAt DateTime?
+  maxUsers  Int      @default(1)
+  maxMessages Int    @default(1000)
+  status    String   @default("active")
+  trialStartsAt DateTime?
+  trialEndsAt   DateTime?
+  manualAccessUntil DateTime?
+  accessBlockedAt DateTime?
+  accessBlockReason String?
+  supportAccessUntil DateTime?
+  supportAccessReason String @default("")
+  supportAccessGrantedByUserId String?
+  privacyPolicyAcceptedAt DateTime?
+  privacyPolicyVersion String @default("2026-06-12")
+  dataProcessingBasis String @default("execucao_contrato")
+  whatsappConnectionMode String @default("official_new_number")
+  whatsappPhoneOption String @default("new_number")
+  whatsappDesiredPhone String @default("")
+  whatsappOfficialStatus String @default("not_started")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rules             FaqRule[]
+  leads             Lead[]
+  memberships       Membership[]
+  stages            PipelineStage[]
+  conversations     Conversation[]
+  messages          Message[]
+  whatsappInstances WhatsappInstance[]
+  invitations       TeamInvitation[]
+  subscriptions     Subscription[]
+  payments          Payment[]
+  aiAssistantConfig AiAssistantConfig?
+  knowledgeItems    KnowledgeItem[]
+  supportAccessLogs SupportAccessLog[]
+}
+
+model AiAssistantConfig {
+  id                  String   @id @default(cuid())
+  companyId           String   @unique
+  enabled             Boolean  @default(false)
+  responseMode        String   @default("auto")
+  openAiApiKey        String?
+  businessDescription String   @default("")
+  tone                String   @default("profissional, humano e objetivo")
+  instructions        String   @default("")
+  handoffKeywords     String   @default("preço,valor,contrato,humano,atendente,reclamação,cancelar")
+  fallbackMessage     String   @default("Vou chamar uma pessoa da equipe para te ajudar melhor.")
+  urgentAlertPhone    String   @default("")
+  maxContextMessages  Int      @default(10)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+}
+
+model KnowledgeItem {
+  id        String   @id @default(cuid())
+  companyId String
+  title     String
+  content   String
+  category  String   @default("geral")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, category])
+  @@index([companyId, active])
+}
+
+model Membership {
+  id        String   @id @default(cuid())
+  userId    String
+  companyId String
+  role      String   @default("owner")
+  createdAt DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, companyId])
+  @@index([companyId])
+}
+
+model TeamInvitation {
+  id              String    @id @default(cuid())
+  companyId       String
+  email           String
+  role            String    @default("agent")
+  token           String    @unique
+  invitedByUserId String?
+  acceptedAt      DateTime?
+  expiresAt       DateTime
+  createdAt       DateTime  @default(now())
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invitedBy User?   @relation("InvitedByUser", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([email])
+}
+
+model FaqRule {
+  id           String   @id @default(cuid())
+  companyId    String
+  name         String
+  triggerType  String   @default("contains")
+  triggerValue String
+  responseText String
+  priority     Int      @default(0)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, priority])
+}
+
+model Lead {
+  id          String   @id @default(cuid())
+  companyId   String
+  phone       String
+  contactName String?
+  message     String
+  stage       String   @default("novo")
+  createdAt   DateTime @default(now())
+
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@index([companyId, phone])
+  @@index([companyId, stage, createdAt])
+  @@index([companyId, createdAt])
+}
+
+model PipelineStage {
+  id        String   @id @default(cuid())
+  companyId String
+  name      String
+  color     String   @default("#2563eb")
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@index([companyId, position])
+}
+
+model Conversation {
+  id              String    @id @default(cuid())
+  companyId       String
+  leadId          String?
+  contactName     String?
+  phone           String
+  stageId         String?
+  assignedUserId  String?
+  tags            String    @default("")
+  notes           String    @default("")
+  unreadCount     Int       @default(0)
+  lastMessageText String?
+  lastMessageAt   DateTime?
+  isHot           Boolean   @default(false)
+  isArchived      Boolean   @default(false)
+  followUpAt      DateTime?
+  followUpText    String    @default("")
+  followUpSentAt  DateTime?
+  followUpStatus  String    @default("none")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  company      Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead         Lead?          @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  stage        PipelineStage? @relation(fields: [stageId], references: [id], onDelete: SetNull)
+  assignedUser User?          @relation("AssignedUserConversations", fields: [assignedUserId], references: [id], onDelete: SetNull)
+  messages     Message[]
+
+  @@index([companyId, updatedAt])
+  @@index([companyId, phone])
+  @@index([companyId, lastMessageAt])
+  @@index([companyId, stageId, lastMessageAt])
+  @@index([companyId, followUpAt])
+  @@index([leadId])
+}
+
+model Message {
+  id                String   @id @default(uuid())
+  companyId         String
+  conversationId    String
+  direction         String
+  body              String
+  status            String   @default("sent")
+  providerMessageId String?
+  createdAt         DateTime @default(now())
+
+  company      Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@index([companyId])
+  @@index([companyId, createdAt])
+  @@index([companyId, providerMessageId])
+}
+
+model WhatsappInstance {
+  id           String   @id @default(cuid())
+  companyId    String
+  instanceName String   @unique
+  provider     String   @default("evolution_qr")
+  connectionMode String @default("qr_test")
+  phoneNumber  String   @default("")
+  status       String   @default("disconnected")
+  qrCode       String?
+  metaBusinessId String?
+  metaWabaId String?
+  metaPhoneNumberId String?
+  metaAccessToken String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+model Subscription {
+  id                  String    @id @default(cuid())
+  companyId           String
+  provider            String    @default("asaas")
+  providerCustomerId  String?
+  providerSubscriptionId String?
+  plan                String    @default("trial")
+  status              String    @default("trial")
+  amountCents         Int       @default(0)
+  currentPeriodStart  DateTime?
+  currentPeriodEnd    DateTime?
+  nextDueDate         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([status])
+}
+
+model Payment {
+  id                String   @id @default(cuid())
+  companyId         String
+  provider          String   @default("asaas")
+  providerPaymentId String?
+  status            String   @default("pending")
+  billingType       String?
+  amountCents       Int      @default(0)
+  dueDate           DateTime?
+  paidAt            DateTime?
+  invoiceUrl        String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([status])
+}
+
+
+model GoogleIntegration {
+  id String @id @default(cuid())
+  accountEmail String @default("atis.projetosdevolps@gmail.com")
+  oauthClientId String?
+  oauthClientSecret String?
+  oauthRefreshToken String?
+  scopes String @default("")
+  googleAdsCustomerId String?
+  googleAdsLoginCustomerId String?
+  googleAdsDeveloperToken String?
+  ga4PropertyId String?
+  connectedAt DateTime?
+  lastSyncAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+
+model SupportAccessLog {
+  id String @id @default(cuid())
+  companyId String
+  adminUserId String?
+  grantedByUserId String?
+  action String
+  reason String @default("")
+  expiresAt DateTime?
+  createdAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, createdAt])
+  @@index([adminUserId])
+  @@index([action])
+}

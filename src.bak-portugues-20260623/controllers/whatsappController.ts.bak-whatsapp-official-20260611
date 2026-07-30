@@ -1,0 +1,276 @@
+import { Request, Response } from "express";
+import { prisma } from "../lib/prisma";
+import {
+  connectEvolutionInstance,
+  createEvolutionInstance,
+  extractQrCode,
+  getEvolutionConnectionState,
+  hasEvolutionConfig,
+  setEvolutionWebhook,
+} from "../lib/evolution";
+
+function slugInstanceName(value: string) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+}
+
+async function createOrConnectEvolution(instanceName: string, shouldCreateFirst: boolean) {
+  if (shouldCreateFirst) {
+    return createEvolutionInstance(instanceName);
+  }
+
+  try {
+    return await connectEvolutionInstance(instanceName);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.toLowerCase().includes("does not exist")) {
+      return createEvolutionInstance(instanceName);
+    }
+    throw error;
+  }
+}
+
+export async function listWhatsAppInstances(req: Request, res: Response) {
+  try {
+    const companyId = req.auth?.companyId;
+
+    if (!companyId) {
+      return res.status(401).json({ error: "Nao autenticado" });
+    }
+
+    const instances = await prisma.whatsappInstance.findMany({
+      where: { companyId },
+      orderBy: { createdAt: "asc" },
+    });
+
+    return res.json(instances);
+  } catch (error) {
+    return res.status(500).json({ error: "Erro" });
+  }
+}
+
+export async function connectWhatsApp(req: Request, res: Response) {
+  try {
+    const companyId = req.auth?.companyId;
+
+    if (!companyId) {
+      return res.status(401).json({ error: "Não autenticado" });
+    }
+
+    const requestedInstanceName = slugInstanceName(String(req.body.instanceName || "").trim());
+    const instanceName = requestedInstanceName || `staygobot-${companyId.slice(0, 12)}`;
+
+    const existing = await prisma.whatsappInstance.findFirst({
+      where: { companyId },
+    });
+
+    let result;
+    let qrCode = "";
+
+    if (existing) {
+      result = await prisma.whatsappInstance.update({
+        where: { id: existing.id },
+        data: { instanceName, status: "connecting" },
+      });
+    } else {
+      result = await prisma.whatsappInstance.create({
+        data: { companyId, instanceName, status: "connecting" },
+      });
+    }
+
+    if (hasEvolutionConfig()) {
+      try {
+        const created = await createOrConnectEvolution(instanceName, !existing);
+
+        qrCode = extractQrCode(created);
+        result = await prisma.whatsappInstance.update({
+          where: { id: result.id },
+          data: { qrCode: qrCode || result.qrCode, status: qrCode ? "qrcode" : "connecting" },
+        });
+
+        try {
+          await setEvolutionWebhook(instanceName);
+        } catch (webhookError) {
+          console.error("Erro ao configurar webhook Evolution:", webhookError);
+        }
+      } catch (error) {
+        console.error("Erro Evolution connectWhatsApp:", error);
+      }
+    }
+
+    return res.json({
+      ...result,
+      qrCode,
+      evolutionConfigured: hasEvolutionConfig(),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "Erro" });
+  }
+}
+
+export async function getWhatsAppQrCode(req: Request, res: Response) {
+  try {
+    const companyId = req.auth?.companyId;
+    const id = String(req.params.id);
+
+    if (!companyId) {
+      return res.status(401).json({ error: "Nao autenticado" });
+    }
+
+    const instance = await prisma.whatsappInstance.findFirst({
+      where: { id, companyId },
+    });
+
+    if (!instance) {
+      return res.status(404).json({ error: "Instancia nao encontrada" });
+    }
+
+    if (!hasEvolutionConfig()) {
+      return res.json({
+        ...instance,
+        qrCode: instance.qrCode,
+        evolutionConfigured: false,
+      });
+    }
+
+    const safeInstanceName = slugInstanceName(instance.instanceName);
+    const data = await createOrConnectEvolution(safeInstanceName, false);
+    const qrCode = extractQrCode(data);
+
+    const updated = await prisma.whatsappInstance.update({
+      where: { id: instance.id },
+      data: {
+        instanceName: safeInstanceName,
+        qrCode: qrCode || instance.qrCode,
+        status: qrCode ? "qrcode" : "connecting",
+      },
+    });
+
+    return res.json({
+      ...updated,
+      qrCode: qrCode || updated.qrCode,
+      evolutionConfigured: true,
+    });
+  } catch (error) {
+    console.error("Erro getWhatsAppQrCode:", error);
+    return res.status(500).json({ error: "Erro ao buscar QR Code" });
+  }
+}
+
+export async function refreshWhatsAppStatus(req: Request, res: Response) {
+  try {
+    const companyId = req.auth?.companyId;
+    const id = String(req.params.id);
+
+    if (!companyId) {
+      return res.status(401).json({ error: "Nao autenticado" });
+    }
+
+    const instance = await prisma.whatsappInstance.findFirst({
+      where: { id, companyId },
+    });
+
+    if (!instance) {
+      return res.status(404).json({ error: "Instancia nao encontrada" });
+    }
+
+    if (!hasEvolutionConfig()) {
+      return res.json({ ...instance, evolutionConfigured: false });
+    }
+
+    const data = await getEvolutionConnectionState(instance.instanceName);
+    const state =
+      data?.instance?.state ||
+      data?.state ||
+      data?.data?.state ||
+      data?.connectionState ||
+      instance.status;
+
+    const normalizedStatus = String(state).toLowerCase().includes("open")
+      ? "connected"
+      : String(state).toLowerCase();
+
+    const updated = await prisma.whatsappInstance.update({
+      where: { id: instance.id },
+      data: { status: normalizedStatus },
+    });
+
+    return res.json({ ...updated, evolutionConfigured: true });
+  } catch (error) {
+    console.error("Erro refreshWhatsAppStatus:", error);
+    return res.status(500).json({ error: "Erro ao atualizar status" });
+  }
+}
+
+
+export async function getWhatsAppSettings(req: Request, res: Response) {
+  try {
+    const companyId = req.auth?.companyId;
+    if (!companyId) return res.status(401).json({ error: "Nao autenticado" });
+
+    const [company, config] = await Promise.all([
+      prisma.company.findUnique({
+        where: { id: companyId },
+        select: { plan: true, planName: true, expiresAt: true, maxUsers: true, maxMessages: true },
+      }),
+      prisma.aiAssistantConfig.upsert({
+        where: { companyId },
+        create: { companyId },
+        update: {},
+      }),
+    ]);
+
+    return res.json({
+      plan: company,
+      responseMode: config.responseMode || "auto",
+      openAiKeyConfigured: Boolean(config.openAiApiKey),
+      urgentAlertPhone: config.urgentAlertPhone || "",
+    });
+  } catch (error) {
+    console.error("Erro getWhatsAppSettings:", error);
+    return res.status(500).json({ error: "Erro ao buscar configuracoes" });
+  }
+}
+
+export async function updateWhatsAppSettings(req: Request, res: Response) {
+  try {
+    const companyId = req.auth?.companyId;
+    if (!companyId) return res.status(401).json({ error: "Nao autenticado" });
+
+    const responseMode = req.body?.responseMode === "suggest" ? "suggest" : "auto";
+    const openAiApiKey = String(req.body?.openAiApiKey || "").trim();
+    const clearOpenAiApiKey = Boolean(req.body?.clearOpenAiApiKey);
+    const urgentAlertPhone = String(req.body?.urgentAlertPhone || "").replace(/\D/g, "").slice(0, 20);
+
+    const config = await prisma.aiAssistantConfig.upsert({
+      where: { companyId },
+      create: {
+        companyId,
+        enabled: true,
+        responseMode,
+        ...(openAiApiKey ? { openAiApiKey } : {}),
+        urgentAlertPhone,
+      },
+      update: {
+        responseMode,
+        urgentAlertPhone,
+        ...(openAiApiKey ? { openAiApiKey } : {}),
+        ...(clearOpenAiApiKey ? { openAiApiKey: null } : {}),
+      },
+    });
+
+    return res.json({
+      responseMode: config.responseMode,
+      openAiKeyConfigured: Boolean(config.openAiApiKey),
+      urgentAlertPhone: config.urgentAlertPhone || "",
+    });
+  } catch (error) {
+    console.error("Erro updateWhatsAppSettings:", error);
+    return res.status(500).json({ error: "Erro ao salvar configuracoes" });
+  }
+}
