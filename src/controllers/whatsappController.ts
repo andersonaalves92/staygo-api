@@ -19,6 +19,21 @@ function slugInstanceName(value: string) {
     .slice(0, 48);
 }
 
+function normalizeWhatsAppMode(value?: string | null) {
+  const mode = String(value || "evolution_api");
+  if (mode === "qr_test" || mode === "evolution_qr") return "evolution_api";
+  if (["evolution_api", "official_new_number", "official_existing_number"].includes(mode)) return mode;
+  return "evolution_api";
+}
+
+function isEvolutionMode(mode: string) {
+  return mode === "evolution_api";
+}
+
+function isMetaMode(mode: string) {
+  return mode === "official_new_number" || mode === "official_existing_number";
+}
+
 async function createOrConnectEvolution(instanceName: string, shouldCreateFirst: boolean) {
   if (shouldCreateFirst) {
     return createEvolutionInstance(instanceName);
@@ -62,14 +77,20 @@ export async function connectWhatsApp(req: Request, res: Response) {
       return res.status(401).json({ error: "Não autenticado" });
     }
 
-    const currentUser = req.auth?.userId
-      ? await prisma.user.findUnique({ where: { id: req.auth.userId }, select: { isPlatformAdmin: true } })
-      : null;
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { whatsappConnectionMode: true },
+    });
+    const mode = normalizeWhatsAppMode(company?.whatsappConnectionMode || "evolution_api");
 
-    if (!currentUser?.isPlatformAdmin && process.env.ALLOW_LEGACY_QR !== "true") {
-      return res.status(403).json({
-        error: "QR Code legado bloqueado. Use a WhatsApp Cloud API oficial da Meta para producao.",
+    if (!isEvolutionMode(mode)) {
+      return res.status(400).json({
+        error: "Selecione Evolution API / WhatsApp Web para gerar QR Code. A Meta Cloud API nao usa QR.",
       });
+    }
+
+    if (!hasEvolutionConfig()) {
+      return res.status(503).json({ error: "Evolution API ainda nao esta configurada no servidor." });
     }
 
     const requestedInstanceName = slugInstanceName(String(req.body.instanceName || "").trim());
@@ -89,7 +110,7 @@ export async function connectWhatsApp(req: Request, res: Response) {
       });
     } else {
       result = await prisma.whatsappInstance.create({
-        data: { companyId, instanceName, provider: "evolution_qr", connectionMode: "qr_test", status: "connecting" },
+        data: { companyId, instanceName, provider: "evolution_qr", connectionMode: "evolution_api", status: "connecting" },
       });
     }
 
@@ -233,7 +254,7 @@ export async function getWhatsAppSettings(req: Request, res: Response) {
     const companyId = req.auth?.companyId;
     if (!companyId) return res.status(401).json({ error: "Nao autenticado" });
 
-    const [company, config, officialInstance] = await Promise.all([
+    const [company, config, officialInstance, evolutionInstance] = await Promise.all([
       prisma.company.findUnique({
         where: { id: companyId },
         select: {
@@ -257,6 +278,10 @@ export async function getWhatsAppSettings(req: Request, res: Response) {
         where: { companyId, provider: "meta_cloud_api" },
         orderBy: { updatedAt: "desc" },
       }),
+      prisma.whatsappInstance.findFirst({
+        where: { companyId, provider: "evolution_qr" },
+        orderBy: { updatedAt: "desc" },
+      }),
     ]);
 
     return res.json({
@@ -275,6 +300,10 @@ export async function getWhatsAppSettings(req: Request, res: Response) {
             metaPhoneNumberId: officialInstance?.metaPhoneNumberId || "",
             metaAccessTokenConfigured: Boolean(officialInstance?.metaAccessToken),
             webhookUrl: "https://app.staygobot.com/api/webhooks/meta",
+            evolutionWebhookUrl: "https://app.staygobot.com/api/webhooks/evolution",
+            evolutionConfigured: hasEvolutionConfig(),
+            evolutionStatus: evolutionInstance?.status || "not_connected",
+            evolutionInstanceName: evolutionInstance?.instanceName || "",
           }
         : null,
     });
@@ -293,10 +322,8 @@ export async function updateWhatsAppSettings(req: Request, res: Response) {
     const openAiApiKey = String(req.body?.openAiApiKey || "").trim();
     const clearOpenAiApiKey = Boolean(req.body?.clearOpenAiApiKey);
     const urgentAlertPhone = String(req.body?.urgentAlertPhone || "").replace(/\D/g, "").slice(0, 20);
-    const allowedModes = ["official_new_number", "official_existing_number", "qr_test"];
-    const whatsappConnectionMode = allowedModes.includes(String(req.body?.whatsappConnectionMode))
-      ? String(req.body.whatsappConnectionMode)
-      : undefined;
+    const rawWhatsAppMode = String(req.body?.whatsappConnectionMode || "").trim();
+    const whatsappConnectionMode = rawWhatsAppMode ? normalizeWhatsAppMode(rawWhatsAppMode) : undefined;
     const whatsappDesiredPhone = String(req.body?.whatsappDesiredPhone || "").replace(/\D/g, "").slice(0, 20);
     const metaBusinessId = String(req.body?.metaBusinessId || "").trim();
     const metaWabaId = String(req.body?.metaWabaId || "").trim();
@@ -304,10 +331,10 @@ export async function updateWhatsAppSettings(req: Request, res: Response) {
     const metaAccessToken = String(req.body?.metaAccessToken || "").trim();
 
     if (whatsappConnectionMode) {
-      const phoneOption = whatsappConnectionMode === "official_existing_number"
+      const phoneOption = isEvolutionMode(whatsappConnectionMode)
+        ? "evolution_api"
+        : whatsappConnectionMode === "official_existing_number"
         ? "existing_number"
-        : whatsappConnectionMode === "qr_test"
-          ? "qr_test"
           : "new_number";
 
       await prisma.company.update({
@@ -316,11 +343,13 @@ export async function updateWhatsAppSettings(req: Request, res: Response) {
           whatsappConnectionMode,
           whatsappPhoneOption: phoneOption,
           whatsappDesiredPhone,
-          whatsappOfficialStatus: whatsappConnectionMode === "qr_test" ? "qr_test" : (metaPhoneNumberId && metaAccessToken ? "official_configured" : "pending_meta_setup"),
+          whatsappOfficialStatus: isEvolutionMode(whatsappConnectionMode)
+            ? (hasEvolutionConfig() ? "evolution_ready" : "evolution_missing_config")
+            : (metaPhoneNumberId && metaAccessToken ? "official_configured" : "pending_meta_setup"),
         },
       });
 
-      if (whatsappConnectionMode !== "qr_test") {
+      if (isMetaMode(whatsappConnectionMode)) {
         const existingOfficial = await prisma.whatsappInstance.findFirst({
           where: { companyId, provider: "meta_cloud_api" },
         });
@@ -342,6 +371,29 @@ export async function updateWhatsAppSettings(req: Request, res: Response) {
               companyId,
               instanceName: "meta-" + companyId.slice(0, 12),
               ...officialData,
+            },
+          });
+        }
+      }
+
+      if (isEvolutionMode(whatsappConnectionMode)) {
+        const existingEvolution = await prisma.whatsappInstance.findFirst({
+          where: { companyId, provider: "evolution_qr" },
+        });
+        const evolutionData = {
+          provider: "evolution_qr",
+          connectionMode: "evolution_api",
+          phoneNumber: whatsappDesiredPhone,
+          status: existingEvolution?.status || "disconnected",
+        };
+        if (existingEvolution) {
+          await prisma.whatsappInstance.update({ where: { id: existingEvolution.id }, data: evolutionData });
+        } else {
+          await prisma.whatsappInstance.create({
+            data: {
+              companyId,
+              instanceName: "evolution-" + companyId.slice(0, 12),
+              ...evolutionData,
             },
           });
         }

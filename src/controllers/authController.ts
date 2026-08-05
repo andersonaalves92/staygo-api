@@ -219,14 +219,15 @@ export async function login(req: Request, res: Response) {
 // 🔥 REGISTER
 //
 function normalizeWhatsAppMode(value?: string) {
-  const allowed = ["official_new_number", "official_existing_number", "qr_test"];
-  const mode = String(value || "official_new_number");
-  return allowed.includes(mode) ? mode : "official_new_number";
+  const mode = String(value || "evolution_api");
+  if (mode === "qr_test" || mode === "evolution_qr") return "evolution_api";
+  const allowed = ["evolution_api", "official_new_number", "official_existing_number"];
+  return allowed.includes(mode) ? mode : "evolution_api";
 }
 
 function whatsappPhoneOption(mode: string) {
+  if (mode === "evolution_api") return "evolution_api";
   if (mode === "official_existing_number") return "existing_number";
-  if (mode === "qr_test") return "qr_test";
   return "new_number";
 }
 
@@ -264,14 +265,27 @@ export async function register(req: Request, res: Response) {
         whatsappConnectionMode,
         whatsappPhoneOption: whatsappPhoneOption(whatsappConnectionMode),
         whatsappDesiredPhone,
-        whatsappOfficialStatus: whatsappConnectionMode === "qr_test" ? "qr_test" : "pending_meta_setup",
+        whatsappOfficialStatus: whatsappConnectionMode === "evolution_api" ? "evolution_pending_qr" : "pending_meta_setup",
         privacyPolicyAcceptedAt: new Date(),
         privacyPolicyVersion: "2026-06-12",
         dataProcessingBasis: "execucao_contrato",
       },
     });
 
-    if (whatsappConnectionMode !== "qr_test") {
+    if (whatsappConnectionMode === "evolution_api") {
+      await prisma.whatsappInstance.create({
+        data: {
+          companyId: company.id,
+          instanceName: "evolution-" + company.id.slice(0, 12),
+          provider: "evolution_qr",
+          connectionMode: "evolution_api",
+          phoneNumber: whatsappDesiredPhone,
+          status: "disconnected",
+        },
+      });
+    }
+
+    if (whatsappConnectionMode !== "evolution_api") {
       await prisma.whatsappInstance.create({
         data: {
           companyId: company.id,

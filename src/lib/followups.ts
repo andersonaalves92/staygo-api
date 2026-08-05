@@ -1,4 +1,4 @@
-import { sendWhatsAppText } from "./whatsappProvider";
+import { canSendWhatsApp, sendWhatsAppText } from "./whatsappProvider";
 import { prisma } from "./prisma";
 
 export async function processDueFollowUps(limit = 30) {
@@ -33,12 +33,12 @@ export async function processDueFollowUps(limit = 30) {
       conversation.followUpText ||
       "Oi, passando para saber se ficou alguma duvida. Posso te ajudar a seguir com o atendimento?";
 
-    if (!instance) {
+    if (!instance || !canSendWhatsApp(instance)) {
       await prisma.conversation.update({
         where: { id: conversation.id },
-        data: { followUpStatus: "no_whatsapp" },
+        data: { followUpStatus: "no_connected_whatsapp" },
       });
-      results.push({ id: conversation.id, status: "no_whatsapp" });
+      results.push({ id: conversation.id, status: "no_connected_whatsapp" });
       continue;
     }
 

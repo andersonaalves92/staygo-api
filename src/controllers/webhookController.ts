@@ -1,4 +1,4 @@
-import { Request, Response } from "express";
+﻿import { Request, Response } from "express";
 import { prisma } from "../lib/prisma";
 import { generateAssistantReply } from "../lib/aiAssistant";
 import { getEvolutionMediaBase64 } from "../lib/evolution";
@@ -71,11 +71,11 @@ function validateEvolutionWebhook(req: Request) {
   return token === expected;
 }
 
-function isÁudioMessage(raw: any) {
-  return Boolean(raw?.message?.áudioMessage);
+function isAudioMessage(raw: any) {
+  return Boolean(raw?.message?.audioMessage || raw?.message?.pttMessage);
 }
 
-function áudioExtension(mimetype: string) {
+function audioExtension(mimetype: string) {
   if (mimetype.includes("mpeg") || mimetype.includes("mp3")) return "mp3";
   if (mimetype.includes("wav")) return "wav";
   if (mimetype.includes("mp4")) return "mp4";
@@ -83,42 +83,43 @@ function áudioExtension(mimetype: string) {
   return "ogg";
 }
 
-async function transcribeÁudioBase64(base64: string, mimetype: string) {
+async function transcribeAudioBase64(base64: string, mimetype: string) {
   if (!process.env.OPENAI_API_KEY || !base64) return "";
   const cleanBase64 = base64.includes(",") ? base64.split(",").pop() || "" : base64;
   const bytes = Buffer.from(cleanBase64, "base64");
   if (bytes.length === 0) return "";
   const form = new FormData();
-  form.append("file", new Blob([bytes], { type: mimetype || "áudio/ogg" }), "áudio." + áudioExtension(mimetype || "áudio/ogg"));
+  form.append("file", new Blob([bytes], { type: mimetype || "audio/ogg" }), "audio." + audioExtension(mimetype || "audio/ogg"));
   form.append("model", process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe");
   form.append("language", "pt");
-  const response = await fetch("https://api.openai.com/v1/áudio/transcriptions", {
+  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: "Bearer " + process.env.OPENAI_API_KEY },
     body: form,
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || "Erro ao transcrever áudio");
+  if (!response.ok) throw new Error(data?.error?.message || "Erro ao transcrever audio");
   return String(data?.text || "").trim();
 }
 
-async function transcribeEvolutionÁudio(instanceName: string, raw: any) {
-  if (!isÁudioMessage(raw) || !instanceName) return "";
-  const mimetype = raw?.message?.áudioMessage?.mimetype || "áudio/ogg";
+async function transcribeEvolutionAudio(instanceName: string, raw: any) {
+  if (!isAudioMessage(raw) || !instanceName) return "";
+  const audio = raw?.message?.audioMessage || raw?.message?.pttMessage || {};
+  const mimetype = audio?.mimetype || "audio/ogg";
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       const base64 = await getEvolutionMediaBase64(instanceName, raw);
-      const transcript = await transcribeÁudioBase64(base64, mimetype);
-      return transcript ? "[Áudio transcrito] " + transcript : "[Áudio]";
+      const transcript = await transcribeAudioBase64(base64, mimetype);
+      return transcript ? "[Audio transcrito] " + transcript : "[Audio]";
     } catch (error) {
       lastError = error;
       if (attempt < 3) await sleep(700 * attempt);
     }
   }
 
-  throw lastError instanceof Error ? lastError : new Error("Nao foi possivel baixar/transcrever áudio");
+  throw lastError instanceof Error ? lastError : new Error("Nao foi possivel baixar/transcrever audio");
 }
 function extractMessageText(raw: any): string {
   return (
@@ -126,7 +127,7 @@ function extractMessageText(raw: any): string {
     raw?.message?.extendedTextMessage?.text ||
     raw?.message?.imageMessage?.caption ||
     raw?.message?.videoMessage?.caption ||
-    (raw?.message?.áudioMessage ? "[Áudio]" : "") ||
+    (isAudioMessage(raw) ? "[Audio]" : "") ||
     (raw?.message?.imageMessage ? "[Imagem]" : "") ||
     (raw?.message?.videoMessage ? "[Video]" : "") ||
     (raw?.message?.documentMessage ? "[Documento]" : "") ||
@@ -200,7 +201,7 @@ function extractMetaMessageText(message: any) {
     message?.interactive?.list_reply?.title ||
     message?.image?.caption ||
     message?.video?.caption ||
-    (message?.áudio ? "[Áudio]" : "") ||
+    (message?.audio ? "[Audio]" : "") ||
     (message?.image ? "[Imagem]" : "") ||
     (message?.video ? "[Video]" : "") ||
     (message?.document ? "[Documento]" : "") ||
@@ -208,13 +209,13 @@ function extractMetaMessageText(message: any) {
   );
 }
 
-async function transcribeMetaÁudio(instance: any, message: any) {
-  const mediaId = message?.áudio?.id || message?.voice?.id;
-  if (!mediaId || !instance?.metaAccessToken) return "[Áudio]";
-  const mimetype = message?.áudio?.mime_type || "áudio/ogg";
+async function transcribeMetaAudio(instance: any, message: any) {
+  const mediaId = message?.audio?.id || message?.voice?.id;
+  if (!mediaId || !instance?.metaAccessToken) return "[Audio]";
+  const mimetype = message?.audio?.mime_type || "audio/ogg";
   const bytes = await getMetaMediaBytes(mediaId, instance.metaAccessToken);
-  const transcript = await transcribeÁudioBase64(bytes.toString("base64"), mimetype);
-  return transcript ? "[Áudio transcrito] " + transcript : "[Áudio]";
+  const transcript = await transcribeAudioBase64(bytes.toString("base64"), mimetype);
+  return transcript ? "[Audio transcrito] " + transcript : "[Audio]";
 }
 
 async function processInboundWhatsApp(params: {
@@ -358,8 +359,8 @@ export async function metaWebhook(req: Request, res: Response) {
           const phone = normalizePhone(message?.from || "");
           if (!phone) continue;
           let text = extractMetaMessageText(message);
-          if (message?.áudio) {
-            try { text = await transcribeMetaÁudio(instance, message); } catch (error) { console.error("Erro ao transcrever áudio Meta:", error); text = "[Áudio recebido, mas nao foi possivel transcrever automaticamente]"; }
+          if (message?.audio) {
+            try { text = await transcribeMetaAudio(instance, message); } catch (error) { console.error("Erro ao transcrever Ã¡udio Meta:", error); text = "[Audio recebido, mas nao foi possivel transcrever automaticamente]"; }
           }
           if (!text) continue;
           const result = await processInboundWhatsApp({ instance, phone, text, providerMessageId: message?.id || null });
@@ -411,7 +412,7 @@ export async function evolutionWebhook(req: Request, res: Response) {
     }
 
     if (!isSupportedEvent(event)) {
-      return res.json({ ok: true, ignored: true, reason: "evento não tratado" });
+      return res.json({ ok: true, ignored: true, reason: "evento nÃ£o tratado" });
     }
 
     const raw =
@@ -444,12 +445,12 @@ export async function evolutionWebhook(req: Request, res: Response) {
     const phone = normalizePhone((remoteJid || "").split("@")[0]);
     let text = extractMessageText(raw);
 
-    if (isÁudioMessage(raw)) {
+    if (isAudioMessage(raw)) {
       try {
-        text = await transcribeEvolutionÁudio(instanceName, raw);
+        text = await transcribeEvolutionAudio(instanceName, raw);
       } catch (transcriptionError) {
-        console.error("Erro ao transcrever áudio:", transcriptionError);
-        text = "[Áudio recebido, mas nao foi possivel transcrever automaticamente]";
+        console.error("Erro ao transcrever audio:", transcriptionError);
+        text = "[Audio recebido, mas nao foi possivel transcrever automaticamente]";
       }
     }
 
@@ -462,7 +463,7 @@ export async function evolutionWebhook(req: Request, res: Response) {
     }
 
     if (fromMe) {
-      return res.json({ ok: true, ignored: true, reason: "mensagem do próprio sistema" });
+      return res.json({ ok: true, ignored: true, reason: "mensagem do prÃ³prio sistema" });
     }
 
     let instance = instanceName
@@ -760,3 +761,4 @@ export async function evolutionWebhook(req: Request, res: Response) {
     return res.status(500).json({ error: "Erro no webhook" });
   }
 }
+
