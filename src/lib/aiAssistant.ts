@@ -28,7 +28,7 @@ const defaultConfig: AssistantConfig = {
   tone: "profissional, humano e objetivo",
   instructions: "",
   handoffKeywords: "preço,valor,contrato,humano,atendente,reclamação,cancelar,prisão,preso,flagrante,audiência,mandado,intimação,delegacia,violência,urgente,ameaça,busca e apreensão",
-  fallbackMessage: "Entendi. Me conta um pouco mais sobre o que aconteceu para eu organizar melhor para o advogado.",
+  fallbackMessage: "Olá! Me chamo Laura e vou fazer seu primeiro atendimento. Pode me passar seu caso para eu organizar tudo por aqui?",
   urgentAlertPhone: "",
   maxContextMessages: 12,
 };
@@ -96,12 +96,28 @@ function isSimpleGreeting(message: string) {
   ].includes(text);
 }
 
+function timeGreeting() {
+  const hour = Number(new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    hour: "2-digit",
+    hour12: false,
+  }).format(new Date()));
+  if (hour >= 5 && hour < 12) return "Bom dia";
+  if (hour >= 12 && hour < 18) return "Boa tarde";
+  return "Boa noite";
+}
+
+function startsWithGreeting(message: string) {
+  const text = normalizeGreetingText(message);
+  return /^(oi|ola|bom dia|boa tarde|boa noite|opa|e ai)\b/.test(text);
+}
+
 function greetingReply(message: string) {
   const text = normalizeGreetingText(message);
-  if (text.includes("bom dia")) return "Bom dia! Eu sou a Laura, assistente do escritório. Me conta um pouco sobre seu caso para eu organizar o atendimento.";
-  if (text.includes("boa tarde")) return "Boa tarde! Eu sou a Laura, assistente do escritório. Me conta um pouco sobre seu caso para eu organizar o atendimento.";
-  if (text.includes("boa noite")) return "Boa noite! Eu sou a Laura, assistente do escritório. Me conta um pouco sobre seu caso para eu organizar o atendimento.";
-  return "Olá! Eu sou a Laura, assistente do escritório. Me conta um pouco sobre seu caso para eu organizar o atendimento.";
+  if (text.includes("bom dia")) return "Bom dia! Me chamo Laura e vou fazer seu primeiro atendimento. Pode me passar seu caso?";
+  if (text.includes("boa tarde")) return "Boa tarde! Me chamo Laura e vou fazer seu primeiro atendimento. Pode me passar seu caso?";
+  if (text.includes("boa noite")) return "Boa noite! Me chamo Laura e vou fazer seu primeiro atendimento. Pode me passar seu caso?";
+  return timeGreeting() + "! Me chamo Laura e vou fazer seu primeiro atendimento. Pode me passar seu caso?";
 }
 
 function makeReplyShortAndHuman(reply: string, fallback: string) {
@@ -126,16 +142,16 @@ function makeReplyShortAndHuman(reply: string, fallback: string) {
 function handoffReply(message: string) {
   const text = normalizeGreetingText(message);
   if (/violencia|ameaca|maria da penha|medida protetiva/.test(text)) {
-    return "Sinto muito por você estar passando por isso. Antes de avançar: você está em um local seguro agora?";
+    return "Sinto muito por você estar passando por isso. Você está em um local seguro agora?";
   }
   if (/habeas corpus|preso|prisao|flagrante|custodia/.test(text)) {
-    return "Entendi a urgência. Vou sinalizar para o advogado e preciso de um ponto: quem está preso ou em audiência agora?";
+    return "Entendi. Pode me dizer quem está preso ou qual é a urgência agora?";
   }
   if (/intimacao|delegacia|policial/.test(text)) {
-    return "Entendi. Vou organizar isso para o advogado. A intimação é para qual data?";
+    return "Entendi. A intimação é para qual data?";
   }
 
-  return "Entendi. Vou sinalizar para o advogado. Me conta um pouco mais sobre o que aconteceu?";
+  return "Entendi. Me conta um pouco mais sobre o que aconteceu?";
 }
 
 async function buildConversationContext(conversationId?: string, maxContextMessages = 10) {
@@ -151,6 +167,14 @@ async function buildConversationContext(conversationId?: string, maxContextMessa
     .reverse()
     .map((message) => `${message.direction === "inbound" ? "Cliente" : "Atendente"}: ${message.body}`)
     .join("\n");
+}
+
+async function isFirstCustomerTurn(conversationId?: string) {
+  if (!conversationId) return true;
+  const inboundCount = await prisma.message.count({
+    where: { conversationId, direction: "inbound" },
+  });
+  return inboundCount <= 1;
 }
 
 async function buildKnowledge(companyId: string) {
@@ -171,7 +195,7 @@ function buildInstructions(config: AssistantConfig, knowledge = "") {
   return [
     "Voce e Laura, assistente de atendimento via WhatsApp da empresa.",
     "Responda em portugues do Brasil.",
-    "Quando for natural, apresente-se como Laura, assistente do escritório. Nao diga que e inteligencia artificial.",
+    "Na primeira resposta da conversa, apresente-se sempre: 'Me chamo Laura e vou fazer seu primeiro atendimento'. Nao diga que e inteligencia artificial.",
     "Sempre responda curto, natural e humano, como uma pessoa real atendendo no WhatsApp.",
     "Isso vale para qualquer mensagem, nao apenas saudações.",
     "Evite textão. Responda em 1 a 3 frases curtas, com no máximo 320 caracteres quando possivel.",
@@ -179,8 +203,9 @@ function buildInstructions(config: AssistantConfig, knowledge = "") {
     "Se precisar perguntar algo, faça apenas uma pergunta por vez. Nunca peça uma lista de dados de uma vez.",
     "Personalize usando o que o cliente acabou de falar. Nao responda de forma genérica.",
     "Pratique escuta ativa: use frases como 'Entendi', 'Sinto muito por isso' ou 'Certo, vou organizar para o advogado' quando fizer sentido.",
-    "Toda primeira resposta ao cliente deve começar com uma saudação humana e curta.",
-    "Depois da saudação, convide a pessoa a contar mais sobre o caso com uma frase simples, por exemplo: 'Me conta um pouco sobre o que aconteceu.'",
+    "Toda primeira resposta ao cliente deve começar com saudação humana e curta: bom dia, boa tarde, boa noite ou olá.",
+    "Depois da saudação, apresente-se como Laura e convide a pessoa a contar o caso com uma frase simples: 'Pode me passar seu caso?'",
+    "Nunca comece a primeira resposta com 'Entendi', 'vou acionar advogado' ou 'vou sinalizar advogado'. Primeiro acolha, apresente-se e peça o relato.",
     "Se a mensagem do cliente for apenas uma saudação, responda somente com saudação + pedido para contar o caso. Nao faça triagem, nao cite advogado, nao cite urgencia e nao mande lista.",
     "Em respostas seguintes, nao repita perguntas já respondidas no histórico. Use a memória recente antes de perguntar.",
     "Checklist oculto de triagem: fatos principais, envolvidos, cidade, urgência/prazos, flagrante/intimação/audiência, e melhor contato. Extraia esses dados organicamente, um por vez.",
@@ -217,13 +242,17 @@ export async function generateAssistantReply(input: GenerateReplyInput) {
     return { enabled: true, reply: null, handoff: false, responseMode: config.responseMode || "auto", reason: "openai_not_configured" };
   }
 
-  if (input.mode !== "summary" && isSimpleGreeting(input.message)) {
+  const firstCustomerTurn = input.mode !== "summary"
+    ? await isFirstCustomerTurn(input.conversationId)
+    : false;
+
+  if (input.mode !== "summary" && (firstCustomerTurn || isSimpleGreeting(input.message) || startsWithGreeting(input.message))) {
     return {
       enabled: true,
       reply: greetingReply(input.message),
       handoff: false,
       responseMode: config.responseMode || "auto",
-      reason: "simple_greeting",
+      reason: firstCustomerTurn ? "opening_reply" : "simple_greeting",
     };
   }
 

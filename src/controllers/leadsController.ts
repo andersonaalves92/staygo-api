@@ -78,25 +78,35 @@ function isUrgentLead(lead: any) {
 function firstName(name: any) {
   return clean(name).split(/\s+/).filter(Boolean)[0] || "";
 }
+function timeGreeting() {
+  const hour = Number(new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    hour: "2-digit",
+    hour12: false,
+  }).format(new Date()));
+  if (hour >= 5 && hour < 12) return "Bom dia";
+  if (hour >= 12 && hour < 18) return "Boa tarde";
+  return "Boa noite";
+}
 function buildLauraIntakeMessage(lead: any, urgent: boolean) {
   const name = firstName(lead.contactName);
-  const greeting = name ? "Olá, " + name + "." : "Olá.";
-  const topic = lead.urgency ? " sobre " + String(lead.urgency).toLowerCase() : "";
-  const intro = greeting + " Eu sou a Laura, assistente do escritório.";
+  const greetingByTime = timeGreeting();
+  const greeting = name ? greetingByTime + ", " + name + "!" : greetingByTime + "!";
+  const intro = greeting + " Me chamo Laura e vou fazer seu primeiro atendimento.";
   const text = legalUrgencyText(lead);
   if (/violência|violencia|maria da penha|medida protetiva|ameaça|ameaca/.test(text)) {
-    return intro + " Recebi seu contato" + topic + ". Sinto muito por você estar passando por isso. Antes de avançar: você está em um local seguro agora?";
+    return intro + " Antes de qualquer coisa: você está em um local seguro agora?";
   }
   if (/habeas|preso|prisão|prisao|flagrante|custódia|custodia/.test(text)) {
-    return intro + " Recebi seu contato" + topic + " e vou organizar para o advogado. Quem está preso ou com audiência marcada agora?";
+    return intro + " Pode me contar, em poucas palavras, quem está preso ou qual é a urgência?";
   }
   if (/intimação|intimacao|policial|delegacia/.test(text)) {
-    return intro + " Recebi seu contato" + topic + " e vou organizar para o advogado. A intimação é para qual data?";
+    return intro + " Pode me contar qual é o caso e para quando é a intimação?";
   }
   if (urgent) {
-    return intro + " Recebi seu contato e vou priorizar. Me conta um pouco mais sobre o que aconteceu?";
+    return intro + " Pode me passar seu caso para eu organizar o atendimento?";
   }
-  return intro + " Recebi seu contato" + topic + ". Me conta um pouco mais sobre o que aconteceu para eu organizar melhor para o advogado.";
+  return intro + " Pode me passar seu caso para eu organizar o atendimento?";
 }
 function buildLeadSummary(lead: any) {
   return [
