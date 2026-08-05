@@ -434,6 +434,7 @@ export async function createPublicLead(req: Request, res: Response) {
         qualificationNotes: "Triagem pública StayGoBot. Score inicial: " + score + "/100.\n\n" + buildLeadSummary(payload),
       },
     });
+    const lauraMessage = buildLauraIntakeMessage(payload, urgent);
     const conversation = await createLeadConversation(company.id, lead, score, urgent);
     const handoff = await forwardLeadToAttorney(company, lead, conversation.id, score, urgent);
     return res.json({
@@ -443,8 +444,9 @@ export async function createPublicLead(req: Request, res: Response) {
       leadScore: score,
       urgent,
       handoff,
+      lauraMessage,
       whatsappUrl: whatsappUrl(company.leadWhatsappNumber, lead),
-      message: handoff.status === "sent" ? "Lead registrado e encaminhado ao advogado." : "Lead registrado no StayGoBot.",
+      message: "Lead registrado. A Laura iniciou a triagem.",
     });
   } catch (error) {
     console.error("Erro createPublicLead:", error);
