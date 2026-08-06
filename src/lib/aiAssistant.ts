@@ -169,12 +169,16 @@ async function buildConversationContext(conversationId?: string, maxContextMessa
     .join("\n");
 }
 
-async function isFirstCustomerTurn(conversationId?: string) {
-  if (!conversationId) return true;
-  const inboundCount = await prisma.message.count({
+async function customerTurnCount(conversationId?: string) {
+  if (!conversationId) return 0;
+  return prisma.message.count({
     where: { conversationId, direction: "inbound" },
   });
-  return inboundCount <= 1;
+}
+
+function shouldImmediateHumanAlert(message: string) {
+  const text = normalizeGreetingText(message);
+  return /(preso agora|flagrante|audiencia hoje|audiencia de custodia|mandado|policia aqui|risco de vida|ameacando agora|violencia agora)/.test(text);
 }
 
 async function buildKnowledge(companyId: string) {
@@ -210,6 +214,10 @@ function buildInstructions(config: AssistantConfig, knowledge = "") {
     "Em respostas seguintes, nao repita perguntas já respondidas no histórico. Use a memória recente antes de perguntar.",
     "Checklist oculto de triagem: fatos principais, envolvidos, cidade, urgência/prazos, flagrante/intimação/audiência, e melhor contato. Extraia esses dados organicamente, um por vez.",
     "Se já tiver fatos principais, pergunte cidade ou prazo. Se já tiver cidade, pergunte urgência. Se já tiver urgência, pergunte melhor horário ou avise que vai encaminhar.",
+    "Seu objetivo comercial é desenvolver a conversa antes do repasse. Tente obter pelo menos: o que aconteceu, cidade, urgência/prazo e quem é a pessoa envolvida.",
+    "Não encerre cedo. Se o cliente responder pouco, faça uma pergunta curta e acolhedora para ele continuar falando.",
+    "Só fale que vai encaminhar ao advogado depois de ter contexto mínimo ou quando houver risco imediato real.",
+    "Quando o caso estiver quase pronto para o advogado, resuma em uma frase o que entendeu e peça o último dado que falta.",
     "Nao use lista numerada em respostas automáticas. Nao use listas longas, linguagem robotizada, juridiquês, emoji em excesso ou texto com cara de propaganda.",
     "Nao invente preço, prazo, garantia, disponibilidade ou condições comerciais.",
     "Quando precisar de dados para orcamento, faça no máximo uma pergunta objetiva por mensagem.",
@@ -242,9 +250,10 @@ export async function generateAssistantReply(input: GenerateReplyInput) {
     return { enabled: true, reply: null, handoff: false, responseMode: config.responseMode || "auto", reason: "openai_not_configured" };
   }
 
-  const firstCustomerTurn = input.mode !== "summary"
-    ? await isFirstCustomerTurn(input.conversationId)
-    : false;
+  const inboundCount = input.mode !== "summary"
+    ? await customerTurnCount(input.conversationId)
+    : 0;
+  const firstCustomerTurn = inboundCount <= 1;
 
   if (input.mode !== "summary" && (firstCustomerTurn || isSimpleGreeting(input.message) || startsWithGreeting(input.message))) {
     return {
@@ -257,12 +266,13 @@ export async function generateAssistantReply(input: GenerateReplyInput) {
   }
 
   if (input.mode !== "summary" && shouldHandoff(config, input.message)) {
+    const shouldAlertNow = shouldImmediateHumanAlert(input.message) || inboundCount >= 3;
     return {
       enabled: true,
       reply: handoffReply(input.message),
-      handoff: true,
+      handoff: shouldAlertNow,
       responseMode: config.responseMode || "auto",
-      reason: "handoff_keyword",
+      reason: shouldAlertNow ? "handoff_keyword" : "triage_keyword",
     };
   }
 
